@@ -1,0 +1,118 @@
+"""ThreadedSupervisor — run a Supervisor on its own thread + asyncio loop.
+
+The Supervisor's heartbeat tasks need a *running* asyncio loop. If we attach
+them to the trainer actor's main event loop, any synchronous blocking call on
+that loop (e.g. ``ray.get`` inside ``_fit_update_weights``) starves the
+heartbeat — the heartbeat task never gets scheduled and dead replicas are
+never declared. Running on a dedicated thread with a dedicated loop
+guarantees the heartbeat ticks regardless of what the trainer is doing.
+
+Boundary: ``start()`` and ``stop()`` are plain sync methods. The trainer
+calls them from its main thread without awaiting.
+
+Inside the child loop:
+  - ObjectRef awaits work fine (Ray ObjectRefs have no event-loop affinity;
+    awaiting an ``actor.method.remote()`` from any loop is supported).
+  - The ``on_dead`` handler runs on this loop. Its calls into shared CKE
+    state (``CKE.on_replica_dead``) acquire a ``threading.Lock`` to serialise
+    with main-thread reads/clears of ``membership_changed``.
+"""
+from __future__ import annotations
+
+import asyncio
+import logging
+import threading
+from typing import Optional
+
+from .supervisor import Supervisor
+
+
+class ThreadedSupervisor:
+    """Sync wrapper that hosts a ``Supervisor`` on its own thread + loop."""
+
+    def __init__(
+        self,
+        supervisor: Supervisor,
+        *,
+        logger: Optional[logging.Logger] = None,
+    ) -> None:
+        self._supervisor = supervisor
+        self._log = logger or logging.getLogger(__name__)
+        self._thread: Optional[threading.Thread] = None
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._ready = threading.Event()
+        self._start_error: Optional[BaseException] = None
+
+    @property
+    def supervisor(self) -> Supervisor:
+        return self._supervisor
+
+    def start(self, ready_timeout_s: float = 10.0) -> None:
+        if self._thread is not None:
+            raise RuntimeError("ThreadedSupervisor already started")
+        self._ready.clear()
+        self._start_error = None
+        self._thread = threading.Thread(
+            target=self._thread_main,
+            name="ft-supervisor",
+            daemon=True,
+        )
+        self._thread.start()
+        if not self._ready.wait(timeout=ready_timeout_s):
+            raise RuntimeError(
+                f"ThreadedSupervisor: child loop did not become ready in {ready_timeout_s}s"
+            )
+        if self._start_error is not None:
+            raise self._start_error
+        self._log.warning("[FT] ThreadedSupervisor: started on thread %s", self._thread.name)
+
+    def _thread_main(self) -> None:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        self._loop = loop
+
+        async def _bring_up() -> None:
+            self._supervisor.start()
+
+        try:
+            try:
+                loop.run_until_complete(_bring_up())
+            except BaseException as e:
+                self._start_error = e
+                self._ready.set()
+                return
+            self._ready.set()
+            loop.run_forever()
+        finally:
+            try:
+                loop.close()
+            except Exception:
+                pass
+            self._loop = None
+
+    def stop(self, drain_timeout_s: float = 5.0) -> None:
+        thread = self._thread
+        loop = self._loop
+        if thread is None:
+            return
+        if loop is not None and loop.is_running():
+            try:
+                fut = asyncio.run_coroutine_threadsafe(
+                    self._supervisor.stop(drain_timeout_s=drain_timeout_s),
+                    loop,
+                )
+                fut.result(timeout=drain_timeout_s + 5.0)
+            except Exception as e:
+                self._log.warning(
+                    "[FT] ThreadedSupervisor.stop: supervisor.stop raised %r", e
+                )
+            try:
+                loop.call_soon_threadsafe(loop.stop)
+            except Exception:
+                pass
+        thread.join(timeout=drain_timeout_s + 10.0)
+        if thread.is_alive():
+            self._log.warning(
+                "[FT] ThreadedSupervisor.stop: thread did not exit within deadline"
+            )
+        self._thread = None
