@@ -289,7 +289,11 @@ class ServerAdapter(BaseRollout):
         return ServerAdapter._WEIGHTS_TAGS + ["kv_cache"]
 
     def __init__(
-        self, config: RolloutConfig, model_config: HFModelConfig, device_mesh: DeviceMesh, replica_rank: int = -1,
+        self,
+        config: RolloutConfig,
+        model_config: HFModelConfig,
+        device_mesh: DeviceMesh,
+        replica_rank: int = -1,
         name_suffix: str = "",
     ):
         if config.get("quantization", None) == "fp8":

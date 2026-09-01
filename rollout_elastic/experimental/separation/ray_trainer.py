@@ -208,12 +208,12 @@ class SeparateRayPPOTrainer(RayPPOTrainer):
             # Own thread+loop so trainer-main blocking ray.get can't starve heartbeat.
             self._ft_supervisor = ThreadedSupervisor(inner_sup)
             self.checkpoint_manager.set_sync_failure_reporter(self._ft_supervisor.report_failure)
-            self.checkpoint_manager.set_replica_promotion_reporter(
-                self._ft_supervisor.promote_replica
-            )
+            self.checkpoint_manager.set_replica_promotion_reporter(self._ft_supervisor.promote_replica)
             logging.getLogger(__name__).warning(
                 "[FT] init_workers: ThreadedSupervisor created with %d replicas, interval=%s miss_threshold=%s",
-                len(replica_map), ft_cfg.heartbeat_interval_s, ft_cfg.heartbeat_miss_threshold,
+                len(replica_map),
+                ft_cfg.heartbeat_interval_s,
+                ft_cfg.heartbeat_miss_threshold,
             )
 
     def _init_resource_pools(self):

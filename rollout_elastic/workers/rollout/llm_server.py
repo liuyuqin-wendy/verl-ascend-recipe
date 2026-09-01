@@ -96,6 +96,7 @@ class _LoadBalancerCore:
         alive = self._alive_ids()
         if not alive:
             from verl.workers.rollout.fault_tolerance import AllServersFailed
+
             raise AllServersFailed("no alive servers in pool")
 
         sid = min(alive, key=lambda s: self._inflight[s])
@@ -222,7 +223,8 @@ class LLMServerClient:
                 None when FT/progress is off.
             progress_store (Optional[ray.actor.ActorHandle]): RolloutProgressStoreActor
                 handle. None when FT/progress is off.
-            max_model_len (Optional[int]): model context length, used by client to resolve the per-turn token-continuation budget
+            max_model_len (Optional[int]): model context length, used by client
+                to resolve the per-turn token-continuation budget
         """
         self.config = config
         self._load_balancer = load_balancer_handle
@@ -289,8 +291,9 @@ class LLMServerClient:
         translate_fault: bool,
         progress_ctx: Optional[Any] = None,
     ) -> tuple[TokenOutput, str]:
-        """ Single acquire -> call -> release on one server.
-        Shared single attempt primitive used by "generate", "RetryLLMServerClient" and the FullyLLMServerClient while-loop.
+        """Single acquire -> call -> release on one server.
+        Shared single attempt primitive used by "generate", "RetryLLMServerClient"
+        and the FullyLLMServerClient while-loop.
         Return "(TokenOutput, server_id)".
         when "translate_fault" is True, transient faults are translated to ServerUnavailable, otherwise, exceptions
         propagate as-is bit-exact with the pre-FT path.
@@ -406,12 +409,14 @@ class LLMServerClient:
         output.extra_fields["llm_generate_attempts"] = 1
         return output
 
+
 class RetryLLMServerClient(LLMServerClient):
-    """ Cross-server retry for a single prompt, independent of fault tolerance.
+    """Cross-server retry for a single prompt, independent of fault tolerance.
     When a server dies mid-generation, the partial tokens produced so far are lost with the server.
     This client switches to a fresh server and regenerates the response from the original prompt, up to max_retries
     times before raise AllServersFailed.
     """
+
     def __init__(
         self,
         config: DictConfig,
@@ -421,8 +426,14 @@ class RetryLLMServerClient(LLMServerClient):
         progress_store: Optional[ray.actor.ActorHandle] = None,
         max_model_len: Optional[int] = None,
     ):
-        super().__init__(config, servers, load_balancer_handle, run_id=run_id,
-                         progress_store=progress_store, max_model_len=max_model_len)
+        super().__init__(
+            config,
+            servers,
+            load_balancer_handle,
+            run_id=run_id,
+            progress_store=progress_store,
+            max_model_len=max_model_len,
+        )
         self.max_retries = self._ft_max_request_retries()
         self.call_timeout_s = self._ft_call_timeout_s()
         self._last_global_step: Optional[int] = None
@@ -439,12 +450,17 @@ class RetryLLMServerClient(LLMServerClient):
 
     def _flush_token_interval(self) -> int:
         try:
-            return int(OmegaConf.select(self.config, "async_training.fault_tolerance.progress.flush_token_interval", default=64))
+            return int(
+                OmegaConf.select(
+                    self.config, "async_training.fault_tolerance.progress.flush_token_interval", default=64
+                )
+            )
         except (AttributeError, KeyError, TypeError):
             return 64
 
     def _model_version_policy(self):
         from verl.workers.rollout.fault_tolerance import ModelVersionPolicy
+
         try:
             node = OmegaConf.select(self.config, "async_training.fault_tolerance.progress.model_version_policy")
             if node is not None:
@@ -498,8 +514,8 @@ class RetryLLMServerClient(LLMServerClient):
 
         from verl.workers.rollout.fault_tolerance import (
             AllServersFailed,
-            ServerUnavailable,
             ProgressContext,
+            ServerUnavailable,
             VLLMProgressCheckPoint,
         )
 
@@ -537,9 +553,14 @@ class RetryLLMServerClient(LLMServerClient):
                 logger.info(
                     "[progress] run=%s, rid=%s, attempt=%d, outcome=%s, inherited_len=%d"
                     "prefix_len=%d remaining_max_tokens=%d (%s)",
-                    self._run_id, recovery_id, result.attempt_id, result.outcome.name,
-                    result.inherited_prefix_len, len(prefix_for_call),
-                    checkpoint.remaining_max_tokens(), result.failure_detail or "-",
+                    self._run_id,
+                    recovery_id,
+                    result.attempt_id,
+                    result.outcome.name,
+                    result.inherited_prefix_len,
+                    len(prefix_for_call),
+                    checkpoint.remaining_max_tokens(),
+                    result.failure_detail or "-",
                 )
             try:
                 output, server_id = await self._generate_once(
@@ -561,11 +582,15 @@ class RetryLLMServerClient(LLMServerClient):
                     raise
                 retries += 1
                 if retries > max_retries:
-                    raise AllServersFailed(f"RetryLLMServerClient: retries exhausted after {retries} attempts") from None
+                    raise AllServersFailed(
+                        f"RetryLLMServerClient: retries exhausted after {retries} attempts"
+                    ) from None
                 logger.warning(
                     "RetryLLMServerClient: server %s failed (%s), retries %d/%d",
-                    e.server_id, type(e.cause).__name__ if e.cause is not None else 'server-fault',
-                    retries, max_retries,
+                    e.server_id,
+                    type(e.cause).__name__ if e.cause is not None else "server-fault",
+                    retries,
+                    max_retries,
                 )
                 continue
 
@@ -587,18 +612,19 @@ class RetryLLMServerClient(LLMServerClient):
                 else:
                     routed_experts = re_inherited
                 final = TokenOutput(
-                    token_ids = inherited_ids + new_ids,
-                    log_probs = (lp_inherited + lp_new) or None,
-                    routed_experts = routed_experts,
-                    num_preempted = (cp.num_preempted or 0) + (output.num_preempted or 0),
-                    stop_reason = output.stop_reason,
-                    extra_fields = dict(output.extra_fields),
+                    token_ids=inherited_ids + new_ids,
+                    log_probs=(lp_inherited + lp_new) or None,
+                    routed_experts=routed_experts,
+                    num_preempted=(cp.num_preempted or 0) + (output.num_preempted or 0),
+                    stop_reason=output.stop_reason,
+                    extra_fields=dict(output.extra_fields),
                 )
             else:
                 final = output
             output.extra_fields["llm_generate_attempts"] = retries + 1
             output.extra_fields["llm_generate_retries"] = retries
             return final
+
 
 class FullyLLMServerClient(LLMServerClient):
     """FullyLLMServerClient supports resume generation on partial rollout, making rollout interruption
@@ -639,12 +665,17 @@ class FullyLLMServerClient(LLMServerClient):
 
     def _flush_token_interval(self) -> int:
         try:
-            return int(OmegaConf.select(self.config, "async_training.fault_tolerance.progress.flush_token_interval", default=64))
+            return int(
+                OmegaConf.select(
+                    self.config, "async_training.fault_tolerance.progress.flush_token_interval", default=64
+                )
+            )
         except (AttributeError, KeyError, TypeError):
             return 64
 
     def _model_version_policy(self):
         from verl.workers.rollout.fault_tolerance import ModelVersionPolicy
+
         try:
             node = OmegaConf.select(self.config, "async_training.fault_tolerance.progress.model_version_policy")
             if node is not None:
@@ -724,6 +755,7 @@ class FullyLLMServerClient(LLMServerClient):
                     ProgressContext,
                     VLLMProgressCheckPoint,
                 )
+
                 result = await VLLMProgressCheckPoint.create_or_resume(
                     store=self._progress_store,
                     run_id=self._run_id,
@@ -1010,13 +1042,14 @@ class LLMServerManager:
     async def _init_progress_store(self, progress_cfg) -> None:
         """Mode C: create and initialise the StoreActor. Called during FT assembly."""
         from verl.workers.rollout.fault_tolerance import RolloutProgressStoreActor
+
         self._progress_store = RolloutProgressStoreActor.remote()
         await self._progress_store.init.remote(progress_cfg)
 
     def get_client(
-            self,
-            fully_async: bool = False,
-            retry: bool = False,
+        self,
+        fully_async: bool = False,
+        retry: bool = False,
     ) -> LLMServerClient:
         """Get the LLMServerClient to request LLM server replicas.
 
@@ -1091,14 +1124,17 @@ class LLMServerManager:
         self.server_handles.append(new_replica._server_handle)
         log.warning(
             "[FT] spawn_replacement: new replica %s (rank=%s) up and healthy",
-            new_replica._server_address, dead_rank,
+            new_replica._server_address,
+            dead_rank,
         )
         return new_replica
 
     async def _reclaim_ray_resources(self, dead_rank: int, log: logging.Logger) -> None:
         """Kill stale actors, remove their placement groups, then await a full replica's resources."""
         from ray.util.placement_group import (
-            get_placement_group, placement_group_table, remove_placement_group,
+            get_placement_group,
+            placement_group_table,
+            remove_placement_group,
         )
 
         # Named-actor registry doesn't auto-clean on chaos kill; try known patterns.
@@ -1111,12 +1147,16 @@ class LLMServerManager:
         # failed standalone replica.
         nnodes = int(self.rollout_config.nnodes)
         local_world_size = int(self.rollout_config.n_gpus_per_node)
-        candidate_names = [
-            f"rollout_standalone_{dead_rank}{cls}{pg_idx}:{local_rank}"
-            for cls in ("CheckpointEngineWorker", "vLLMHttpServer")
-            for pg_idx in range(nnodes)
-            for local_rank in range(local_world_size)
-        ] + [f"vllm_server_{dead_rank}_{i}" for i in range(nnodes)] + [f"rollout_standalone_{dead_rank}"]
+        candidate_names = (
+            [
+                f"rollout_standalone_{dead_rank}{cls}{pg_idx}:{local_rank}"
+                for cls in ("CheckpointEngineWorker", "vLLMHttpServer")
+                for pg_idx in range(nnodes)
+                for local_rank in range(local_world_size)
+            ]
+            + [f"vllm_server_{dead_rank}_{i}" for i in range(nnodes)]
+            + [f"rollout_standalone_{dead_rank}"]
+        )
         for name in candidate_names:
             try:
                 handle = ray.get_actor(name)

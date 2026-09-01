@@ -3,6 +3,7 @@
 Per spec §硬规则.可关性: `enabled=False` must yield bit-exact existing behavior.
 All defaults are non-intrusive.
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -64,4 +65,5 @@ class FaultToleranceConfig:
 def _default_progress_config() -> ProgressConfig:
     """Late import to avoid circular dependency at module load time."""
     from verl.workers.rollout.fault_tolerance.progress.types import ProgressConfig
+
     return ProgressConfig()

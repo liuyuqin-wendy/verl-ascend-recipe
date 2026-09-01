@@ -161,9 +161,7 @@ class StageResult:
         """Whether every failure is a retryable rollout-side failure."""
 
         return self.membership_changed or (
-            bool(self.failures)
-            and not self.trainer_failed
-            and all(failure.retryable for failure in self.failures)
+            bool(self.failures) and not self.trainer_failed and all(failure.retryable for failure in self.failures)
         )
 
 

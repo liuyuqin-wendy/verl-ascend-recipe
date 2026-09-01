@@ -221,6 +221,7 @@ class vLLMColocateWorkerExtension:
             device=self.device,
             use_shm=use_shm,
         )
+
         def on_bucket_received(weights):
             if fence is None:
                 self._update_weights(weights, peft_config=peft_config, base_sync_done=base_sync_done)
@@ -228,9 +229,7 @@ class vLLMColocateWorkerExtension:
             return fence.apply_if_current(
                 attempt_id,
                 target_version,
-                lambda: self._update_weights(
-                    weights, peft_config=peft_config, base_sync_done=base_sync_done
-                ),
+                lambda: self._update_weights(weights, peft_config=peft_config, base_sync_done=base_sync_done),
             )
 
         receiver.receive_weights(

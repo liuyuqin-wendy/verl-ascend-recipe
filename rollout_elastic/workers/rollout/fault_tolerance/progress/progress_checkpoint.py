@@ -6,6 +6,7 @@ replica process) where ``ingest`` is called inside the ``async for`` streaming
 loop. Flushes are fire-and-forget ``store.save.remote(payload)`` calls; the
 store actor serializes writes per ``recovery_id``.
 """
+
 from __future__ import annotations
 
 import copy
@@ -17,7 +18,6 @@ from typing import Any, Optional
 
 from verl.workers.rollout.fault_tolerance.progress.types import (
     CheckPointPayLoad,
-    LoadFailure,
     LoadResult,
     ModelVersionPolicy,
     ResumeOutcome,
@@ -105,7 +105,7 @@ class VLLMProgressCheckPoint:
                 else:
                     rebuilt.append(0.0)
             if self.cumulative_log_probs is not None:
-                self.cumulative_log_probs = (list(self.cumulative_log_probs[: self.inherited_prefix_len]) + rebuilt)
+                self.cumulative_log_probs = list(self.cumulative_log_probs[: self.inherited_prefix_len]) + rebuilt
             else:
                 self.cumulative_log_probs = rebuilt
 
@@ -114,6 +114,7 @@ class VLLMProgressCheckPoint:
         if routed is not None:
             if self.cumulative_routed_experts is not None and self.inherited_prefix_len > 0:
                 import torch
+
                 inherited_routed = self.cumulative_routed_experts[: self.inherited_prefix_len]
                 self.cumulative_routed_experts = torch.cat([inherited_routed, routed], dim=0)
             else:
@@ -145,7 +146,10 @@ class VLLMProgressCheckPoint:
         except Exception as e:  # actor dead / serialization error
             logger.warning(
                 "VLLMProgressCheckPoint flush failed (run=%s rid=%s attempt=%d): %s",
-                self.run_id, self.recovery_id, self.attempt_id, e,
+                self.run_id,
+                self.recovery_id,
+                self.attempt_id,
+                e,
             )
         self._tokens_since_last_flush = 0
 
@@ -206,7 +210,7 @@ class VLLMProgressCheckPoint:
         cls,
         payload: CheckPointPayLoad,
         flush_token_interval: int,
-    ) -> "VLLMProgressCheckPoint":
+    ) -> VLLMProgressCheckPoint:
         """Reconstruct a checkpoint from a payload (internal helper).
 
         ``create_or_resume`` is the public entry; it mixes caller-supplied
@@ -222,7 +226,9 @@ class VLLMProgressCheckPoint:
             inherited_prefix_len=payload.inherited_prefix_len,
             base_attempt_id=payload.attempt_id,
             cumulative_token_ids=list(payload.cumulative_token_ids),
-            cumulative_log_probs=list(payload.cumulative_log_probs) if payload.cumulative_log_probs is not None else None,
+            cumulative_log_probs=list(payload.cumulative_log_probs)
+            if payload.cumulative_log_probs is not None
+            else None,
             cumulative_routed_experts=payload.cumulative_routed_experts,
             num_preempted=payload.num_preempted,
             finished=payload.finished,
@@ -237,13 +243,11 @@ class VLLMProgressCheckPoint:
         """Lightweight in-memory integrity check; raises on inconsistency."""
         if self.inherited_prefix_len > len(self.cumulative_token_ids):
             raise ValueError(
-                f"inherited_prefix_len {self.inherited_prefix_len} > "
-                f"cumulative {len(self.cumulative_token_ids)}"
+                f"inherited_prefix_len {self.inherited_prefix_len} > cumulative {len(self.cumulative_token_ids)}"
             )
         if self.cumulative_log_probs is not None and len(self.cumulative_log_probs) != len(self.cumulative_token_ids):
             raise ValueError(
-                f"log_probs len {len(self.cumulative_log_probs)} != "
-                f"tokens len {len(self.cumulative_token_ids)}"
+                f"log_probs len {len(self.cumulative_log_probs)} != tokens len {len(self.cumulative_token_ids)}"
             )
 
     # ------------------------------------------------------------------ create_or_resume
@@ -292,7 +296,9 @@ class VLLMProgressCheckPoint:
                 inherited_prefix_len=len(payload.cumulative_token_ids),
                 base_attempt_id=payload.attempt_id,
                 cumulative_token_ids=list(payload.cumulative_token_ids),
-                cumulative_log_probs=list(payload.cumulative_log_probs) if payload.cumulative_log_probs is not None else None,
+                cumulative_log_probs=list(payload.cumulative_log_probs)
+                if payload.cumulative_log_probs is not None
+                else None,
                 cumulative_routed_experts=payload.cumulative_routed_experts,
                 num_preempted=payload.num_preempted,
                 finished=False,
@@ -302,12 +308,17 @@ class VLLMProgressCheckPoint:
             cp.attach_store(store)
             try:
                 await store.mark_superseded.remote(
-                    run_id=run_id, recovery_id=recovery_id, attempt_id=payload.attempt_id,
+                    run_id=run_id,
+                    recovery_id=recovery_id,
+                    attempt_id=payload.attempt_id,
                 )
             except Exception as e:
                 logger.warning(
                     "mark_superseded failed (run=%s rid=%s attempt=%d): %s",
-                    run_id, recovery_id, payload.attempt_id, e,
+                    run_id,
+                    recovery_id,
+                    payload.attempt_id,
+                    e,
                 )
             return ResumeResult(
                 checkpoint=cp,
@@ -339,7 +350,11 @@ class VLLMProgressCheckPoint:
         cp.attach_store(store)
         logger.info(
             "[progress] run=%s rid=%s attempt=%d DEGRADED_FRESH(prev=%s) reason=%s",
-            run_id, recovery_id, new_aid, prev_aid, result.detail,
+            run_id,
+            recovery_id,
+            new_aid,
+            prev_aid,
+            result.detail,
         )
         return ResumeResult(
             checkpoint=cp,

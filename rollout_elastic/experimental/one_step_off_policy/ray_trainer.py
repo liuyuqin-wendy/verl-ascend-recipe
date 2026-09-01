@@ -201,11 +201,11 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
     async def _init_one_step_progress(self) -> None:
         import logging as _ft_logging
 
-        from verl.workers.rollout.fault_tolerance import ModelVersionPolicy, ProgressConfig
-
         try:
             ft_enabled = bool(OmegaConf.select(self.config, "async_training.fault_tolerance.enabled", default=False))
-            progress_enabled = bool(OmegaConf.select(self.config, "async_training.fault_tolerance.progress.enabled", default=False))
+            progress_enabled = bool(
+                OmegaConf.select(self.config, "async_training.fault_tolerance.progress.enabled", default=False)
+            )
         except Exception as e:
             _ft_logging.getLogger(__name__).warning("[FT] init_one_step_progress failed: %s", e)
             return
@@ -219,7 +219,8 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
         _ft_logging.getLogger(__name__).info(
             "[FT] one-step token continuation enabled: run_id=%s, store=%s"
             "(client resolved via get_client(retry = True))",
-            self.llm_server_manager.run_id, progress_config.persist_root,
+            self.llm_server_manager.run_id,
+            progress_config.persist_root,
         )
 
     def _build_progress_config(self, progress_node):
@@ -334,6 +335,7 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
             self._ft_supervisor.start()
         else:
             import logging as _ft_logging
+
             _ft_logging.getLogger(__name__).warning("[FT] fit: _ft_supervisor is None — no FT detection")
 
         try:
@@ -423,16 +425,19 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
 
                 repeated_parts = [batch] * repeats
                 if remainder != 0:
-                    repeated_parts.append(batch[: remainder])
+                    repeated_parts.append(batch[:remainder])
 
                 from verl.protocol import DataProto
+
                 padded_batch = DataProto.concat(repeated_parts)
                 return padded_batch
 
         with marked_timer("step", self.timing_raw):
             batch, batch_data_future = await self._fit_generate(batch_data_future, continuous_iterator)
 
-            batch = pad_batch_to_size(batch, self.config.actor_rollout_ref.rollout.n * self.config.data.train_batch_size)
+            batch = pad_batch_to_size(
+                batch, self.config.actor_rollout_ref.rollout.n * self.config.data.train_batch_size
+            )
 
             # await asyncio.sleep(0) ensures:
             # Asynchronous tasks can start executing immediately

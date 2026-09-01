@@ -5,6 +5,7 @@ all requests across replicas before weight sync) should not topple the calling
 op when one replica is dead. The contract is: run all concurrently, log per-task
 failures, and never raise.
 """
+
 from __future__ import annotations
 
 import asyncio

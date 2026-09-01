@@ -136,8 +136,12 @@ class RolloutProgressStore:
                 raise
             except Exception:
                 self._write_failed += 1
-                logger.exception("[progress-store] shutdown drain failed for %s/%s/%s",
-                                 payload.run_id, payload.recovery_id, payload.attempt_id)
+                logger.exception(
+                    "[progress-store] shutdown drain failed for %s/%s/%s",
+                    payload.run_id,
+                    payload.recovery_id,
+                    payload.attempt_id,
+                )
             finally:
                 self._clear_pending(key)
         for t in self._tasks:
@@ -158,18 +162,21 @@ class RolloutProgressStore:
             self._dropped_pending += 1
             logger.warning(
                 "[progress-store] dropping save for %s/%s (pending=%d >= cap=%d)",
-                payload.run_id, payload.recovery_id, self._pending.get(key, 0), cap
+                payload.run_id,
+                payload.recovery_id,
+                self._pending.get(key, 0),
+                cap,
             )
             return
         self._pending[key] = self._pending.get(key, 0) + 1
         self._write_queue.put_nowait(payload)
 
     async def load_latest(
-            self,
-            run_id: str,
-            recovery_id: str,
-            requested_model_version: Optional[str],
-            policy: ModelVersionPolicy,
+        self,
+        run_id: str,
+        recovery_id: str,
+        requested_model_version: Optional[str],
+        policy: ModelVersionPolicy,
     ) -> LoadResult:
         self._ensure_started()
         async with self._lock:
@@ -283,37 +290,40 @@ class RolloutProgressStore:
                 raise
             except Exception:
                 self._write_failed += 1
-                logger.exception("[progress-store] save failed for %s/%s/%s",
-                                 payload.run_id, payload.recovery_id, payload.attempt_id
-                                 )
+                logger.exception(
+                    "[progress-store] save failed for %s/%s/%s", payload.run_id, payload.recovery_id, payload.attempt_id
+                )
             finally:
                 self._clear_pending(key)
 
     async def _do_save(self, payload: CheckPointPayLoad) -> None:
         slot = self._index.get((payload.run_id, payload.recovery_id))
         if slot is not None and payload.attempt_id < slot.latest_attempt_id:
-            logger.warning("[progress-store] dropping stale attempt %s/%s/%s, latest = %s",
-                           payload.run_id, payload.recovery_id, payload.attempt_id, slot.latest_attempt_id
-                           )
+            logger.warning(
+                "[progress-store] dropping stale attempt %s/%s/%s, latest = %s",
+                payload.run_id,
+                payload.recovery_id,
+                payload.attempt_id,
+                slot.latest_attempt_id,
+            )
             return
-        attempt_dir = (self._root
-                       / _safe_component(payload.run_id)
-                       / _safe_component(payload.recovery_id)
-                       / str(payload.attempt_id)
-                       )
+        attempt_dir = (
+            self._root
+            / _safe_component(payload.run_id)
+            / _safe_component(payload.recovery_id)
+            / str(payload.attempt_id)
+        )
         tmp_dir = Path(f"{attempt_dir}.tmp")
         try:
             if tmp_dir.exists():
                 shutil.rmtree(tmp_dir)
             tmp_dir.mkdir(parents=True)
             await self._write_shard(
-                tmp_dir / TOKENS_BIN,
-                np.asarray(payload.cumulative_token_ids, dtype=np.int32).tobytes()
+                tmp_dir / TOKENS_BIN, np.asarray(payload.cumulative_token_ids, dtype=np.int32).tobytes()
             )
             if payload.cumulative_log_probs is not None:
                 await self._write_shard(
-                    tmp_dir / LOGPROBS_BIN,
-                    np.asarray(payload.cumulative_log_probs, dtype=np.float32).tobytes()
+                    tmp_dir / LOGPROBS_BIN, np.asarray(payload.cumulative_log_probs, dtype=np.float32).tobytes()
                 )
             if payload.cumulative_routed_experts is not None:
                 await self._write_shard(tmp_dir / ROUTING_BIN, pickle.dumps(payload.cumulative_routed_experts))
@@ -385,10 +395,12 @@ class RolloutProgressStore:
             run_id=payload.run_id,
             recovery_id=payload.recovery_id,
             attempt_id=payload.attempt_id,
-            dir_path=str(self._root
-                         / _safe_component(payload.run_id)
-                         / _safe_component(payload.recovery_id)
-                         / str(payload.attempt_id)),
+            dir_path=str(
+                self._root
+                / _safe_component(payload.run_id)
+                / _safe_component(payload.recovery_id)
+                / str(payload.attempt_id)
+            ),
             durable_offset=durable_offset,
             model_weight_version=payload.model_weight_version,
             finished=payload.finished,
@@ -414,7 +426,7 @@ class RolloutProgressStore:
     async def _read_json(self, path: Path) -> Optional[dict]:
         if not path.exists():
             return None
-        with open(path, "r", encoding="utf-8") as f:
+        with open(path, encoding="utf-8") as f:
             return json.load(f)
 
     def _read_array(self, path: Path, dtype):
@@ -486,9 +498,7 @@ class RolloutProgressStore:
                         with open(attempt_dir / MANIFEST, encoding="utf-8") as f:
                             manifest = json.load(f)
                     except (OSError, json.JSONDecodeError):
-                        logger.warning(
-                            "[progress-store] skip unreadable manifest %s", attempt_dir / MANIFEST
-                        )
+                        logger.warning("[progress-store] skip unreadable manifest %s", attempt_dir / MANIFEST)
                         continue
                     if not isinstance(manifest, dict):
                         continue
@@ -496,7 +506,8 @@ class RolloutProgressStore:
                     recovery_id = manifest.get("recovery_id")
                     if not run_id or not recovery_id or manifest.get("attempt_id") != attempt_id:
                         logger.warning(
-                            "[progress-store] skip inconsistent manifest %s", attempt_dir / MANIFEST,
+                            "[progress-store] skip inconsistent manifest %s",
+                            attempt_dir / MANIFEST,
                         )
                         continue
                     finished = bool(manifest.get("finished", False))

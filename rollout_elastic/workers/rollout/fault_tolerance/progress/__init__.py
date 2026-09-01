@@ -1,4 +1,5 @@
 """Token-continuation progress subpackage: VLLMProgressCheckPoint + RolloutProgressStoreActor."""
+
 from verl.workers.rollout.fault_tolerance.progress.progress_checkpoint import VLLMProgressCheckPoint
 from verl.workers.rollout.fault_tolerance.progress.progress_store_actor import RolloutProgressStoreActor
 from verl.workers.rollout.fault_tolerance.progress.types import (

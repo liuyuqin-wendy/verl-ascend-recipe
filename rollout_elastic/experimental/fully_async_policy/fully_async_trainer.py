@@ -229,9 +229,7 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             replicas=replicas,
             fault_tolerance=ft_cfg,
             load_balancer_handle=lb_handle,
-            sync_failure_reporter=(
-                lambda replica_id, source: rollouter.report_sync_failure.remote(replica_id, source)
-            ),
+            sync_failure_reporter=(lambda replica_id, source: rollouter.report_sync_failure.remote(replica_id, source)),
             replica_promotion_reporter=(
                 lambda replica_id, servers, attempt_id, target_version: (
                     rollouter.promote_synced_replica.remote(

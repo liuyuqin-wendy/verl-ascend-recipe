@@ -295,8 +295,7 @@ class BucketedWeightReceiver:
             while True:
                 metadata = self.socket.recv_pyobj()
                 context_matches = attempt_id is None or (
-                    metadata.get("attempt_id") == attempt_id
-                    and metadata.get("target_version") == target_version
+                    metadata.get("attempt_id") == attempt_id and metadata.get("target_version") == target_version
                 )
                 if attempt_validator is not None:
                     context_matches = context_matches and attempt_validator(attempt_id, target_version)

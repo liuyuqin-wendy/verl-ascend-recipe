@@ -8,6 +8,7 @@ results into ok outputs and failures, applying the `min_ok_ratio` policy.
 
 Kept Ray-free / DataProto-free so it can be unit-tested in isolation.
 """
+
 from __future__ import annotations
 
 from typing import Any

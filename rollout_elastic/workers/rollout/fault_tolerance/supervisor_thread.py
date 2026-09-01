@@ -17,6 +17,7 @@ Inside the child loop:
     state (``CKE.on_replica_dead``) acquire a ``threading.Lock`` to serialise
     with main-thread reads/clears of ``membership_changed``.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -94,9 +95,7 @@ class ThreadedSupervisor:
         )
         self._thread.start()
         if not self._ready.wait(timeout=ready_timeout_s):
-            raise RuntimeError(
-                f"ThreadedSupervisor: child loop did not become ready in {ready_timeout_s}s"
-            )
+            raise RuntimeError(f"ThreadedSupervisor: child loop did not become ready in {ready_timeout_s}s")
         if self._start_error is not None:
             raise self._start_error
         self._log.warning("[FT] ThreadedSupervisor: started on thread %s", self._thread.name)
@@ -138,16 +137,12 @@ class ThreadedSupervisor:
                 )
                 fut.result(timeout=drain_timeout_s + 5.0)
             except Exception as e:
-                self._log.warning(
-                    "[FT] ThreadedSupervisor.stop: supervisor.stop raised %r", e
-                )
+                self._log.warning("[FT] ThreadedSupervisor.stop: supervisor.stop raised %r", e)
             try:
                 loop.call_soon_threadsafe(loop.stop)
             except Exception:
                 pass
         thread.join(timeout=drain_timeout_s + 10.0)
         if thread.is_alive():
-            self._log.warning(
-                "[FT] ThreadedSupervisor.stop: thread did not exit within deadline"
-            )
+            self._log.warning("[FT] ThreadedSupervisor.stop: thread did not exit within deadline")
         self._thread = None

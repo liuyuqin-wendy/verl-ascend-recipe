@@ -43,9 +43,7 @@ def _get_attention_functions() -> tuple[Callable, Callable, Callable, Callable]:
                 seqlens_in_batch = attention_mask.sum(dim=-1, dtype=torch.int32)
                 indices = torch.nonzero(attention_mask.flatten(), as_tuple=False).flatten()
                 max_seqlen_in_batch = seqlens_in_batch.max().item()
-                cu_seqlens = torch.nn.functional.pad(
-                    torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.int32), (1, 0)
-                )
+                cu_seqlens = torch.nn.functional.pad(torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.int32), (1, 0))
                 flat = hidden_states.reshape(-1, *hidden_states.shape[2:])
                 return (flat[indices], indices, cu_seqlens, max_seqlen_in_batch, seqlens_in_batch)
 

@@ -460,10 +460,7 @@ class CheckpointEngineManager:
     def add_pending_replicas(self, replicas: list[RolloutReplica]) -> None:
         """Register healthy replacements without admitting them to sync/LB yet."""
         with self._dead_lock:
-            known_ids = {
-                self._replica_id(replica)
-                for replica in tuple(self.replicas) + tuple(self._pending_replicas)
-            }
+            known_ids = {self._replica_id(replica) for replica in tuple(self.replicas) + tuple(self._pending_replicas)}
             for replica in replicas:
                 replica_id = self._replica_id(replica)
                 if replica_id not in known_ids:
@@ -491,8 +488,7 @@ class CheckpointEngineManager:
                 replicas = tuple(self.replicas) + tuple(self._pending_replicas)
             return tuple(self._snapshot_replica(replica) for replica in replicas)
         return tuple(
-            member if isinstance(member, ReplicaSnapshot) else self._snapshot_replica(member)
-            for member in members
+            member if isinstance(member, ReplicaSnapshot) else self._snapshot_replica(member) for member in members
         )
 
     def _create_attempt(self, global_steps: int | None, retry_members=None) -> WeightSyncAttempt:
@@ -515,13 +511,9 @@ class CheckpointEngineManager:
             if self._membership_epoch != attempt.membership_epoch:
                 return False
             current_by_id = {
-                self._replica_id(replica): replica
-                for replica in tuple(self.replicas) + tuple(self._pending_replicas)
+                self._replica_id(replica): replica for replica in tuple(self.replicas) + tuple(self._pending_replicas)
             }
-        return all(
-            current_by_id.get(snapshot.replica_id) is snapshot.replica
-            for snapshot in attempt.replicas
-        )
+        return all(current_by_id.get(snapshot.replica_id) is snapshot.replica for snapshot in attempt.replicas)
 
     def _build_rollout_worker_group(self, replicas=None) -> RayWorkerGroup:
         if replicas is None:
@@ -572,15 +564,12 @@ class CheckpointEngineManager:
         rollout = self._build_rollout_worker_group(attempt)
         self._reset_generation += 1
         gen = self._reset_generation
-        refs = (
-            self.trainer.execute_checkpoint_engine(
-                method=["force_destroy_nccl_group"] * self.trainer.world_size,
-                generation=[gen] * self.trainer.world_size,
-            )
-            + rollout.execute_checkpoint_engine(
-                method=["force_destroy_nccl_group"] * rollout.world_size,
-                generation=[gen] * rollout.world_size,
-            )
+        refs = self.trainer.execute_checkpoint_engine(
+            method=["force_destroy_nccl_group"] * self.trainer.world_size,
+            generation=[gen] * self.trainer.world_size,
+        ) + rollout.execute_checkpoint_engine(
+            method=["force_destroy_nccl_group"] * rollout.world_size,
+            generation=[gen] * rollout.world_size,
         )
         if not refs:
             return
@@ -619,8 +608,7 @@ class CheckpointEngineManager:
     def _stage_refs(self, refs: list, attempt: WeightSyncAttempt) -> list[StageRef]:
         """Attach fixed replica IDs to the flattened Ray worker order."""
         members = [
-            StageRef(ref, SyncMember("trainer", index))
-            for index, ref in enumerate(refs[: self.trainer.world_size])
+            StageRef(ref, SyncMember("trainer", index)) for index, ref in enumerate(refs[: self.trainer.world_size])
         ]
         rollout_refs = refs[self.trainer.world_size :]
         rollout_index = 0
@@ -642,9 +630,7 @@ class CheckpointEngineManager:
             )
         return members
 
-    def _raise_stage_failure(
-        self, attempt: WeightSyncAttempt, stage: WeightSyncStage, result
-    ) -> None:
+    def _raise_stage_failure(self, attempt: WeightSyncAttempt, stage: WeightSyncStage, result) -> None:
         if result.failures or result.membership_changed:
             raise WeightSyncStageFailure(
                 stage.value,
@@ -683,10 +669,9 @@ class CheckpointEngineManager:
         if rollout is None:
             rollout = self._build_rollout_worker_group(attempt)
         if not ft_on:
-            prepare_refs = (
-                trainer.execute_checkpoint_engine(["prepare"] * trainer.world_size)
-                + rollout.execute_checkpoint_engine(["prepare"] * rollout.world_size)
-            )
+            prepare_refs = trainer.execute_checkpoint_engine(
+                ["prepare"] * trainer.world_size
+            ) + rollout.execute_checkpoint_engine(["prepare"] * rollout.world_size)
             metadata = ray.get(prepare_refs)
             trainer_kwargs, rollout_kwargs = self.backend_cls.build_topology(
                 trainer.world_size, rollout.world_size, metadata
@@ -705,10 +690,9 @@ class CheckpointEngineManager:
 
         # Prepare and init are separate stages so a failure is attributed to
         # the exact remote member before the transaction is retried.
-        prepare_refs = (
-            trainer.execute_checkpoint_engine(["prepare"] * trainer.world_size)
-            + rollout.execute_checkpoint_engine(["prepare"] * rollout.world_size)
-        )
+        prepare_refs = trainer.execute_checkpoint_engine(
+            ["prepare"] * trainer.world_size
+        ) + rollout.execute_checkpoint_engine(["prepare"] * rollout.world_size)
         metadata = await self._wait_worker_stage(
             prepare_refs,
             attempt=attempt,
@@ -745,8 +729,7 @@ class CheckpointEngineManager:
         with self._dead_lock:
             if self._ft_enabled() and self._sync_in_progress:
                 known_ids = {
-                    self._replica_id(replica)
-                    for replica in tuple(self.replicas) + tuple(self._pending_replicas)
+                    self._replica_id(replica) for replica in tuple(self.replicas) + tuple(self._pending_replicas)
                 }
                 for replica in replicas:
                     replica_id = self._replica_id(replica)
@@ -808,9 +791,7 @@ class CheckpointEngineManager:
             epoch,
         )
 
-    def _membership_stage_failure(
-        self, attempt: WeightSyncAttempt, stage: WeightSyncStage
-    ) -> WeightSyncStageFailure:
+    def _membership_stage_failure(self, attempt: WeightSyncAttempt, stage: WeightSyncStage) -> WeightSyncStageFailure:
         """Build a stale-attempt error without attributing it to a wrong worker."""
         return WeightSyncStageFailure(
             stage.value,
@@ -832,6 +813,7 @@ class CheckpointEngineManager:
             try:
                 operation = operation_factory(snapshot.replica)
             except BaseException as error:
+
                 async def failed_operation(error=error):
                     raise error
 
@@ -941,6 +923,7 @@ class CheckpointEngineManager:
                 logger.warning("[FT] sync failure reporter rejected %s: %r", replica_id, error)
                 continue
             if inspect.isawaitable(result):
+
                 async def drain_report(result=result, replica_id=replica_id):
                     try:
                         await result
@@ -968,33 +951,26 @@ class CheckpointEngineManager:
                 # Supervisor may have removed the member already.  Reuse only
                 # members still registered, without deleting healthy replicas.
                 current_ids = {
-                    self._replica_id(replica)
-                    for replica in tuple(self.replicas) + tuple(self._pending_replicas)
+                    self._replica_id(replica) for replica in tuple(self.replicas) + tuple(self._pending_replicas)
                 }
             else:
                 active_before = {self._replica_id(replica) for replica in self.replicas}
-                self.replicas[:] = [
-                    replica for replica in self.replicas if self._replica_id(replica) not in failed_ids
-                ]
+                self.replicas[:] = [replica for replica in self.replicas if self._replica_id(replica) not in failed_ids]
                 self._pending_replicas[:] = [
                     replica for replica in self._pending_replicas if self._replica_id(replica) not in failed_ids
                 ]
-                active_removed = active_before - {
-                    self._replica_id(replica) for replica in self.replicas
-                }
+                active_removed = active_before - {self._replica_id(replica) for replica in self.replicas}
                 if active_removed:
                     self._membership_epoch += 1
                     self.membership_changed = True
                 current_ids = {
-                    self._replica_id(replica)
-                    for replica in tuple(self.replicas) + tuple(self._pending_replicas)
+                    self._replica_id(replica) for replica in tuple(self.replicas) + tuple(self._pending_replicas)
                 }
 
             surviving = tuple(
                 snapshot
                 for snapshot in attempt.replicas
-                if snapshot.replica_id in current_ids
-                and (membership_changed or snapshot.replica_id not in failed_ids)
+                if snapshot.replica_id in current_ids and (membership_changed or snapshot.replica_id not in failed_ids)
             )
 
         if not surviving:
@@ -1107,9 +1083,7 @@ class CheckpointEngineManager:
                             member=SyncMember("rollout", server_index, snapshot.replica_id),
                             kind="version_mismatch",
                             error_type="VersionMismatch",
-                            error_message=(
-                                f"expected version {attempt.target_version}, got {actual}"
-                            ),
+                            error_message=(f"expected version {attempt.target_version}, got {actual}"),
                             retryable=True,
                         )
                     )
@@ -1128,8 +1102,7 @@ class CheckpointEngineManager:
         attempt_ids = {snapshot.replica_id for snapshot in attempt.replicas}
         with self._dead_lock:
             current_ids = {
-                self._replica_id(replica)
-                for replica in tuple(self.replicas) + tuple(self._pending_replicas)
+                self._replica_id(replica) for replica in tuple(self.replicas) + tuple(self._pending_replicas)
             }
             if self._membership_epoch != attempt.membership_epoch or not attempt_ids.issubset(current_ids):
                 raise self._membership_stage_failure(attempt, WeightSyncStage.VERIFY_VERSION)
@@ -1140,11 +1113,7 @@ class CheckpointEngineManager:
         """Move synced pending replicas to active only after LB acknowledgement."""
         attempt_ids = {snapshot.replica_id for snapshot in attempt.replicas}
         with self._dead_lock:
-            promoted = [
-                replica
-                for replica in self._pending_replicas
-                if self._replica_id(replica) in attempt_ids
-            ]
+            promoted = [replica for replica in self._pending_replicas if self._replica_id(replica) in attempt_ids]
         if not promoted:
             return
         acknowledged = list(promoted)
@@ -1180,11 +1149,7 @@ class CheckpointEngineManager:
                 if getattr(replica, "_server_address", None) is not None
                 and getattr(replica, "_server_handle", None) is not None
             }
-        if (
-            self.replica_promotion_reporter is None
-            and servers
-            and self.load_balancer_handle is not None
-        ):
+        if self.replica_promotion_reporter is None and servers and self.load_balancer_handle is not None:
             try:
                 await self.load_balancer_handle.add_servers.remote(servers)
             except Exception as error:
@@ -1196,21 +1161,13 @@ class CheckpointEngineManager:
                 return
         promoted_ids = {self._replica_id(replica) for replica in acknowledged}
         with self._dead_lock:
-            current = [
-                replica
-                for replica in self._pending_replicas
-                if self._replica_id(replica) in promoted_ids
-            ]
+            current = [replica for replica in self._pending_replicas if self._replica_id(replica) in promoted_ids]
             current_ids = {self._replica_id(replica) for replica in current}
             self._pending_replicas[:] = [
-                replica
-                for replica in self._pending_replicas
-                if self._replica_id(replica) not in current_ids
+                replica for replica in self._pending_replicas if self._replica_id(replica) not in current_ids
             ]
             active_ids = {self._replica_id(replica) for replica in self.replicas}
-            self.replicas.extend(
-                replica for replica in current if self._replica_id(replica) not in active_ids
-            )
+            self.replicas.extend(replica for replica in current if self._replica_id(replica) not in active_ids)
 
     async def _wake_and_resume(self, attempt: WeightSyncAttempt) -> None:
         """Resume healthy committed members even when another member fails to wake."""
@@ -1222,9 +1179,7 @@ class CheckpointEngineManager:
             member_timeout_s,
         )
         failed_ids = set(wake_result.failed_replica_ids)
-        survivors = tuple(
-            snapshot for snapshot in attempt.replicas if snapshot.replica_id not in failed_ids
-        )
+        survivors = tuple(snapshot for snapshot in attempt.replicas if snapshot.replica_id not in failed_ids)
         resume_result = None
         if survivors:
             resume_attempt = WeightSyncAttempt(
@@ -1345,9 +1300,7 @@ class CheckpointEngineManager:
                         failed_ids = set(failure.failed_replica_ids)
                         self._report_sync_failure(failure.failed_replica_ids, failure.stage)
                         failed_replicas = [
-                            snapshot.replica
-                            for snapshot in attempt.replicas
-                            if snapshot.replica_id in failed_ids
+                            snapshot.replica for snapshot in attempt.replicas if snapshot.replica_id in failed_ids
                         ]
                         if failed_replicas:
                             await self._remove_replicas_and_servers(failed_replicas)
@@ -1369,9 +1322,7 @@ class CheckpointEngineManager:
                             self._report_sync_failure(failure.failed_replica_ids, failure.stage)
                             failed_ids = set(failure.failed_replica_ids)
                             failed_replicas = [
-                                snapshot.replica
-                                for snapshot in attempt.replicas
-                                if snapshot.replica_id in failed_ids
+                                snapshot.replica for snapshot in attempt.replicas if snapshot.replica_id in failed_ids
                             ]
                             if failed_replicas:
                                 await self._remove_replicas_and_servers(failed_replicas)

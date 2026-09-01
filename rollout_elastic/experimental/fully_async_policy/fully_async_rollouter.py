@@ -483,7 +483,7 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
             if self._trainer_handle is None:
                 return
             try:
-                ref = (self._trainer_handle._on_replica_dead_from_supervisor.remote(replica_id))
+                ref = self._trainer_handle._on_replica_dead_from_supervisor.remote(replica_id)
                 await asyncio.wrap_future(ref.future())
             except Exception as e:
                 _ft_log.warning(
@@ -666,9 +666,7 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         from omegaconf import OmegaConf
 
         try:
-            ft_enabled = bool(
-                OmegaConf.select(self.config, "async_training.fault_tolerance.enabled", default=False)
-            )
+            ft_enabled = bool(OmegaConf.select(self.config, "async_training.fault_tolerance.enabled", default=False))
             progress_enabled = bool(
                 OmegaConf.select(self.config, "async_training.fault_tolerance.progress.enabled", default=False)
             )
@@ -682,8 +680,6 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
                 progress_enabled,
             )
             return
-
-        from verl.workers.rollout.fault_tolerance import ModelVersionPolicy, ProgressConfig
 
         progress_node = OmegaConf.select(self.config, "async_training.fault_tolerance.progress")
         progress_config = self._build_progress_config(progress_node)

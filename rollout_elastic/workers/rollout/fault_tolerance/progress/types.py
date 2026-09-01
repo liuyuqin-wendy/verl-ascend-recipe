@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import Any, Optional
 
+
 @dataclass
 class ProgressConfig:
     enabled: bool = False
@@ -12,14 +13,16 @@ class ProgressConfig:
     gc_delay_s: float = 300.0
     gc_period_s: float = 60.0
     gc_retry_backoff_s: float = 30.0
-    model_version_policy: ModelVersionPolicy = field(default_factory=lambda: ModelVersionPolicy(mode = "exact"))
+    model_version_policy: ModelVersionPolicy = field(default_factory=lambda: ModelVersionPolicy(mode="exact"))
     write_timeout_s: float = 30.0
     max_pending_writes_per_recovery: int = 8
     stats_log_interval_s: float = 60.0
 
+
 @dataclass
 class ModelVersionPolicy:
     mode: str = "exact"
+
     def check(self, payload_version: Optional[str], request_version: Optional[str]) -> bool:
         if self.mode == "relaxed":
             return True
@@ -30,6 +33,7 @@ class ModelVersionPolicy:
                 return True
             return payload_version == request_version
         raise ValueError(f"Unknown model version policy mode: {self.mode}")
+
 
 @dataclass
 class CheckPointPayLoad:
@@ -50,13 +54,16 @@ class CheckPointPayLoad:
     updated_at: float
     schema_version: int = 1
 
+
 @dataclass
 class ProgressContext:
     checkpoint: Any
 
+
 class ResumeOutcome(Enum):
     RESUMED = auto()
     DEGRADED_FRESH = auto()
+
 
 @dataclass
 class ResumeResult:
@@ -66,6 +73,7 @@ class ResumeResult:
     inherited_prefix_len: int
     failure_detail: Optional[str] = None
 
+
 class LoadFailure(Enum):
     NOT_FOUND = auto()
     RUN_ID_MISMATCH = auto()
@@ -74,12 +82,14 @@ class LoadFailure(Enum):
     MODEL_VERSION_BLOCKED = auto()
     CORRUPTED = auto()
 
+
 @dataclass
 class LoadResult:
     payload: Optional[CheckPointPayLoad]
     failure: Optional[LoadFailure]
     detail: str
     prev_attempt_id: Optional[int] = None
+
 
 @dataclass
 class GCStats:
@@ -89,6 +99,7 @@ class GCStats:
     failed_paths: list[str] = field(default_factory=list)
     orphan_tmp_cleaned: int = 0
     last_collect_at: float = 0.0
+
 
 __all__ = [
     "CheckPointPayLoad",

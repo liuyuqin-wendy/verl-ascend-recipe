@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from typing import Any
-
 import ray
 
 from verl.workers.rollout.fault_tolerance.progress.progress_store import RolloutProgressStore
@@ -12,6 +10,7 @@ from verl.workers.rollout.fault_tolerance.progress.types import (
     ModelVersionPolicy,
     ProgressConfig,
 )
+
 
 @ray.remote
 class RolloutProgressStoreActor:

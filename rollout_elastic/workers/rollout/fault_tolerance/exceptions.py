@@ -4,6 +4,7 @@ Per spec §硬规则: production code must catch via `is_transient_fault(exc)`,
 not by specific Ray exception class — Ray wraps/subclasses unpredictably across
 versions.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -91,9 +92,7 @@ class BuildGroupPartialFailure(Exception):
     def __init__(self, dead_workers: list, stage: str | None = None) -> None:
         self.dead_workers = list(dead_workers)
         self.stage = stage
-        super().__init__(
-            f"build_process_group dropped {len(self.dead_workers)} dead members"
-        )
+        super().__init__(f"build_process_group dropped {len(self.dead_workers)} dead members")
 
     def __reduce__(self):
         return (type(self), (self.dead_workers, self.stage))
@@ -120,16 +119,12 @@ class WeightSyncStageFailure(Exception):
         self.failures = tuple(failures)
         self.membership_changed = membership_changed
         super().__init__(
-            f"weight-sync stage {stage!r} failed in attempt {attempt_id} "
-            f"with {len(self.failures)} member failure(s)"
+            f"weight-sync stage {stage!r} failed in attempt {attempt_id} with {len(self.failures)} member failure(s)"
         )
 
     @property
     def trainer_failed(self) -> bool:
-        return any(
-            getattr(getattr(failure, "member", None), "side", None) == "trainer"
-            for failure in self.failures
-        )
+        return any(getattr(getattr(failure, "member", None), "side", None) == "trainer" for failure in self.failures)
 
     @property
     def failed_replica_ids(self) -> tuple[str, ...]:
@@ -138,11 +133,7 @@ class WeightSyncStageFailure(Exception):
         for failure in self.failures:
             member = getattr(failure, "member", None)
             replica_id = getattr(member, "replica_id", None)
-            if (
-                getattr(member, "side", None) == "rollout"
-                and replica_id is not None
-                and replica_id not in seen
-            ):
+            if getattr(member, "side", None) == "rollout" and replica_id is not None and replica_id not in seen:
                 seen.add(replica_id)
                 result.append(replica_id)
         return tuple(result)

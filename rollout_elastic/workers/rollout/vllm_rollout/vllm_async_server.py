@@ -629,15 +629,9 @@ class vLLMHttpServer:
 
     async def begin_weight_sync(self, attempt_id: int, target_version: int | None = None) -> bool:
         """Open a monotonic sync context for this server actor."""
-        if (
-            self._weight_sync_attempt_id is not None
-            and attempt_id < self._weight_sync_attempt_id
-        ):
+        if self._weight_sync_attempt_id is not None and attempt_id < self._weight_sync_attempt_id:
             return False
-        if (
-            self._weight_sync_attempt_id == attempt_id
-            and self._weight_sync_target_version != target_version
-        ):
+        if self._weight_sync_attempt_id == attempt_id and self._weight_sync_target_version != target_version:
             return False
         self._weight_sync_attempt_id = attempt_id
         self._weight_sync_target_version = target_version
@@ -646,8 +640,7 @@ class vLLMHttpServer:
     async def set_global_steps(self, global_steps: int, attempt_id: int | None = None):
         """Set the global steps of the model weights."""
         if attempt_id is not None and (
-            attempt_id != self._weight_sync_attempt_id
-            or global_steps != self._weight_sync_target_version
+            attempt_id != self._weight_sync_attempt_id or global_steps != self._weight_sync_target_version
         ):
             from verl.workers.rollout.vllm_rollout.bucketed_weight_transfer import StaleWeightSyncAttempt
 

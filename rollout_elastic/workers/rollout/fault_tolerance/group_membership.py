@@ -17,6 +17,7 @@ Rationale (validated via /codex:rescue preview):
   - `ray.wait` / `ray.get` are injected so this module is testable without
     `ray.init()`.
 """
+
 from __future__ import annotations
 
 from typing import Any, Callable
@@ -54,12 +55,8 @@ def split_refs_by_timeout(
         return list(ray_get_fn(list(refs))), [], []
 
     not_ready_set = {id(r) for r in not_ready}
-    trainer_dead: list[int] = [
-        i for i in range(trainer_world_size) if id(refs[i]) in not_ready_set
-    ]
+    trainer_dead: list[int] = [i for i in range(trainer_world_size) if id(refs[i]) in not_ready_set]
     rollout_dead: list[int] = [
-        i - trainer_world_size
-        for i in range(trainer_world_size, len(refs))
-        if id(refs[i]) in not_ready_set
+        i - trainer_world_size for i in range(trainer_world_size, len(refs)) if id(refs[i]) in not_ready_set
     ]
     return [], trainer_dead, rollout_dead

@@ -17,6 +17,7 @@ Design:
   - Once a replica transitions to dead, it is never re-probed (INV-6: dead
     replicas don't receive new traffic, including probes).
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -158,7 +159,8 @@ class Supervisor:
                 except Exception as e:
                     self._log.error(
                         "[FT] supervisor consumer: on_dead handler for %s raised: %r",
-                        replica_id, e,
+                        replica_id,
+                        e,
                     )
                 finally:
                     self._pending_dead.discard(replica_id)
@@ -208,7 +210,8 @@ class Supervisor:
             except asyncio.TimeoutError:
                 self._log.warning(
                     "[FT] supervisor: %s did not drain in %.1fs; cancelling",
-                    task_attr, drain_timeout_s,
+                    task_attr,
+                    drain_timeout_s,
                 )
                 task.cancel()
                 try:
@@ -354,7 +357,9 @@ def make_on_dead(
             except Exception as e:
                 log.error(
                     "[FT] on_dead: lb.remove_servers(%s) for replica %s raised: %r",
-                    server_ids, replica_id, e,
+                    server_ids,
+                    replica_id,
+                    e,
                 )
         # Step 2: CKE local callback (atomic remove + flag set, see CheckpointEngineManager.on_replica_dead)
         if ckpt_mgr_callback is not None:
@@ -363,7 +368,8 @@ def make_on_dead(
             except Exception as e:
                 log.error(
                     "[FT] on_dead: ckpt_mgr_callback(%s) raised: %r",
-                    replica_id, e,
+                    replica_id,
+                    e,
                 )
         # Step 3: background spawn (optional, idempotent per replica_id)
         if spawner is not None:
