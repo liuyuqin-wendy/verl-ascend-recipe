@@ -42,23 +42,40 @@ train
 
 ## Quickstart
 
-Mount this module inside your verl install (e.g. copy `experimental/fully_async_policy` to `verl/experimental/...`), or add this repo to `PYTHONPATH` so the `verl.experimental` imports resolve, then:
+This recipe does **not** modify any verl source file.
+It extends a vanilla `verl@dfc01f85` install purely through Python decorators:
+at import time `rollout_elastic.patch` rewrites verl's native classes in memory
+(new classes / methods, e.g. the `fault_tolerance` package, are kept as-is in
+this repo).
 
 ```bash
-# fully-async
+# 1. Install verl at the pinned version (see REQUIRED_VERL.txt)
+pip install "verl @ git+https://github.com/verl-project/verl.git@dfc01f85"
+
+# 2. Make this repo importable and let verl load the decorator patch entry
+export PYTHONPATH=$PWD:$PYTHONPATH
+export VERL_USE_EXTERNAL_MODULES=rollout_elastic.patch
+
+# 3. fully-async
 python3 -m verl.experimental.fully_async_policy.fully_async_main \
     --config-path=config --config-name='fully_async_ppo_trainer' \
     actor_rollout_ref.model.path=<MODEL_PATH> \
     data.train_files=<TRAIN_FILES> \
     rollout.n_gpus_per_node=8
 
-# one-step-off
+# 4. one-step-off
 python3 -m verl.trainer.main_ppo \
     --config-path=config --config-name='one_step_off_ppo_trainer' \
     actor_rollout_ref.model.path=<MODEL_PATH> \
     data.train_files=<TRAIN_FILES> \
     trainer.trainer_fn=verl.experimental.one_step_off_policy.ray_trainer.OneStepOffRayTrainer
 ```
+
+`VERL_USE_EXTERNAL_MODULES` is verl's native external-module hook: setting it to
+`rollout_elastic.patch` makes verl import `rollout_elastic.patch` during its
+`__init__`, whose side effect is calling `install()` to mount the recipe-owned
+`fault_tolerance` package into `verl.workers.rollout` and apply every decorator
+patch. The patches are idempotent, so re-imports are safe.
 
 ## Configuration
 
