@@ -11,6 +11,7 @@ from verl.workers.rollout.fault_tolerance.exceptions import (
     BatchMostlyFailed,
     BuildGroupPartialFailure,
     ServerUnavailable,
+    WeightSyncStageFailure,
     is_transient_fault,
 )
 from verl.workers.rollout.fault_tolerance.group_membership import split_refs_by_timeout
@@ -34,6 +35,19 @@ from verl.workers.rollout.fault_tolerance.supervisor import (
 )
 from verl.workers.rollout.fault_tolerance.supervisor_thread import ThreadedSupervisor
 from verl.workers.rollout.fault_tolerance.types import FaultToleranceConfig
+from verl.workers.rollout.fault_tolerance.weight_sync import (
+    ReplicaSnapshot,
+    StageFailure,
+    StageRef,
+    StageResult,
+    StaleWeightSyncAttempt,
+    SyncMember,
+    WeightSyncAttempt,
+    WeightSyncFence,
+    WeightSyncStage,
+    wait_ray_stage,
+    wait_replica_stage,
+)
 
 __all__ = [
     "AllServersFailed",
@@ -49,16 +63,28 @@ __all__ = [
     "ProgressConfig",
     "ProgressContext",
     "RAY_FAULT_EXCEPTIONS",
+    "ReplicaSnapshot",
     "ResumeOutcome",
     "ResumeResult",
     "RolloutProgressStoreActor",
     "ServerUnavailable",
+    "StageFailure",
+    "StageRef",
+    "StageResult",
+    "StaleWeightSyncAttempt",
+    "SyncMember",
     "Supervisor",
     "ThreadedSupervisor",
     "VLLMProgressCheckPoint",
+    "WeightSyncStage",
+    "WeightSyncFence",
+    "WeightSyncAttempt",
+    "WeightSyncStageFailure",
     "filter_partial_batch",
     "is_transient_fault",
     "lenient_gather",
     "make_on_dead",
     "split_refs_by_timeout",
+    "wait_ray_stage",
+    "wait_replica_stage",
 ]

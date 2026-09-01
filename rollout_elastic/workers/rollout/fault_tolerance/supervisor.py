@@ -79,6 +79,7 @@ class Supervisor:
         replicas: dict[str, Any],
         probe_fn: Callable[[Any], Awaitable[bool]],
         on_dead: Callable[[str], Awaitable[None]],
+        promote_fn: Optional[Callable[[dict[str, Any]], Awaitable[None]]] = None,
         interval_s: float,
         miss_threshold: int,
         probe_timeout_s: float,
@@ -94,6 +95,7 @@ class Supervisor:
         self.replicas: dict[str, Any] = dict(replicas)
         self.probe_fn = probe_fn
         self.on_dead = on_dead
+        self.promote_fn = promote_fn
         self.interval_s = interval_s
         self.probe_timeout_s = probe_timeout_s
         self.tracker = HeartbeatTracker(miss_threshold=miss_threshold)
@@ -105,6 +107,12 @@ class Supervisor:
         self._dead_queue: Optional[asyncio.Queue[None]] = None
         self._consumer_task: Optional[asyncio.Task[None]] = None
         self._pending_dead: set[str] = set()
+        self._admission_lock: Optional[asyncio.Lock] = None
+
+    def _get_admission_lock(self) -> asyncio.Lock:
+        if self._admission_lock is None:
+            self._admission_lock = asyncio.Lock()
+        return self._admission_lock
 
     async def _probe_one(self, replica_id: str, handle: Any) -> None:
         try:
@@ -143,7 +151,10 @@ class Supervisor:
                     break
             for replica_id in list(self._pending_dead):
                 try:
-                    await self.on_dead(replica_id)
+                    # LB add and remove share this lock.  If death is observed
+                    # during add, remove necessarily runs after add completes.
+                    async with self._get_admission_lock():
+                        await self.on_dead(replica_id)
                 except Exception as e:
                     self._log.error(
                         "[FT] supervisor consumer: on_dead handler for %s raised: %r",
@@ -175,6 +186,7 @@ class Supervisor:
         self._stop_event = asyncio.Event()
         self._dead_queue = asyncio.Queue()
         self._pending_dead = set()
+        self._admission_lock = asyncio.Lock()
         self._task = asyncio.create_task(self._heartbeat_loop())
         self._consumer_task = asyncio.create_task(self._consumer_loop())
 
@@ -216,6 +228,39 @@ class Supervisor:
         self.tracker.dead.discard(replica_id)
         self.tracker.miss_counts[replica_id] = 0
 
+    async def promote_replica(self, replica_id: str, servers: dict[str, Any]) -> bool:
+        """Admit a synced replica only while it remains alive.
+
+        The same loop serializes this operation with the dead-event consumer,
+        so a concurrent death either rejects admission or removes it afterward.
+        """
+        if self.promote_fn is None:
+            return False
+        async with self._get_admission_lock():
+            if replica_id not in self.replicas or self.tracker.is_dead(replica_id):
+                return False
+            await self.promote_fn(servers)
+            return not self.tracker.is_dead(replica_id)
+
+    def report_failure(self, replica_id: str, source: str = "unknown") -> bool:
+        """Queue an idempotent immediate-death report from another control path."""
+        if replica_id not in self.replicas:
+            self._log.info("[FT] supervisor: ignoring failure for unknown replica %s", replica_id)
+            return False
+        if self.tracker.is_dead(replica_id) or replica_id in self._pending_dead:
+            return False
+        self.tracker.dead.add(replica_id)
+        self.tracker.miss_counts[replica_id] = self.tracker.miss_threshold
+        self._log.warning(
+            "[FT] supervisor: replica %s reported dead by %s",
+            replica_id,
+            source,
+        )
+        if self._dead_queue is not None:
+            self._pending_dead.add(replica_id)
+            self._dead_queue.put_nowait(None)
+        return True
+
     def remove_replica(self, replica_id: str) -> None:
         """Drop a replica from the Supervisor's probe set.
 
@@ -237,16 +282,14 @@ def make_on_dead(
 ) -> Callable[[str], Awaitable[None]]:
     """Build the default ``on_dead`` handler wired to LB + (optional) CKE + spawn.
 
-    Spec contract (§横向系统合同 Supervisor row):
-        "调 lb.mark_failed + checkpoint_mgr.remove_replicas
-         →（可选）后台 task spawn replacement"
-        "spawn 不阻塞心跳循环"
+    Control-plane contract: remove servers from LB admission, notify the
+    checkpoint manager, then optionally spawn a replacement in the background.
 
     Three steps:
 
-    1. LB.mark_failed for every server in the dead replica (fire-and-forget;
-       LB unavailability is logged not raised).
-    2. (optional) CKE.remove_replicas so the next NCCL group rebuild skips it.
+    1. LB.remove_servers for every server in the dead replica (awaited; LB
+       unavailability is logged, not raised).
+    2. (optional) checkpoint-manager callback so the next group rebuild skips it.
     3. (optional) spawn replacement via background asyncio.create_task —
        MUST not block. Idempotent per replica_id: if a spawn for `r0` is
        already in flight, a second on_dead call for `r0` skips step 3.

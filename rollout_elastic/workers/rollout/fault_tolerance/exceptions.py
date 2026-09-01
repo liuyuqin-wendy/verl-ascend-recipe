@@ -97,3 +97,66 @@ class BuildGroupPartialFailure(Exception):
 
     def __reduce__(self):
         return (type(self), (self.dead_workers, self.stage))
+
+
+class WeightSyncStageFailure(Exception):
+    """A weight-sync stage ended without a committable result.
+
+    The exception contains only small, serializable failure summaries.  The
+    checkpoint-engine manager uses rollout failures to prune the failed
+    replica and retry the whole transaction with a fresh member snapshot;
+    trainer failures remain terminal for the current update.
+    """
+
+    def __init__(
+        self,
+        stage: str,
+        attempt_id: int,
+        failures: tuple,
+        membership_changed: bool = False,
+    ) -> None:
+        self.stage = stage
+        self.attempt_id = attempt_id
+        self.failures = tuple(failures)
+        self.membership_changed = membership_changed
+        super().__init__(
+            f"weight-sync stage {stage!r} failed in attempt {attempt_id} "
+            f"with {len(self.failures)} member failure(s)"
+        )
+
+    @property
+    def trainer_failed(self) -> bool:
+        return any(
+            getattr(getattr(failure, "member", None), "side", None) == "trainer"
+            for failure in self.failures
+        )
+
+    @property
+    def failed_replica_ids(self) -> tuple[str, ...]:
+        result: list[str] = []
+        seen: set[str] = set()
+        for failure in self.failures:
+            member = getattr(failure, "member", None)
+            replica_id = getattr(member, "replica_id", None)
+            if (
+                getattr(member, "side", None) == "rollout"
+                and replica_id is not None
+                and replica_id not in seen
+            ):
+                seen.add(replica_id)
+                result.append(replica_id)
+        return tuple(result)
+
+    @property
+    def retryable(self) -> bool:
+        return self.membership_changed or (
+            bool(self.failures)
+            and not self.trainer_failed
+            and all(getattr(failure, "retryable", False) for failure in self.failures)
+        )
+
+    def __reduce__(self):
+        return (
+            type(self),
+            (self.stage, self.attempt_id, self.failures, self.membership_changed),
+        )

@@ -119,6 +119,7 @@ class HCCLCheckpointEngine(CheckpointEngine):
         self.rebuild_group = rebuild_group
         self.rollout_dtype = rollout_dtype
         self.pyhccl = None
+        self._reset_count = 0
         self.device = torch.npu.current_device()
 
         # start zeromq server for broadcasting bucket tensor metadata
@@ -138,10 +139,12 @@ class HCCLCheckpointEngine(CheckpointEngine):
             else None
         )
 
-    def finalize(self):
+    def finalize(self, reset_generation: int | None = None):
         """Destroy the HCCL process group if rebuild_group is True."""
+        if reset_generation is not None and reset_generation < getattr(self, "_reset_count", 0):
+            return True
         if self.rebuild_group:
-            if self.rank >= 0:
+            if getattr(self, "rank", None) is not None and self.rank >= 0 and self.pyhccl is not None:
                 self.pyhccl.destroyComm(self.pyhccl.comm)
                 self.pyhccl = None
             self.rank = None
@@ -192,19 +195,26 @@ class HCCLCheckpointEngine(CheckpointEngine):
         self.socket.connect(address)
         self.socket.setsockopt_string(zmq.SUBSCRIBE, self.topic)
 
-    def force_destory_nccl_group(self, generation: int = None) -> bool:
-        # Bump group_name suffix instead of calling destroy_collective_group
-        # (whilch would ncclCommDestroy-block on the dead peer)
+    def force_destroy_nccl_group(self, generation: int = None) -> bool:
+        """Invalidate the local HCCL communicator generation without peer sync."""
+        last_generation = getattr(self, "_reset_count", 0)
+        if generation is not None and int(generation) <= last_generation:
+            return True
         self.rank = None
         self.world_size = None
         if generation is not None:
             self._reset_count = int(generation)
         else:
-            self._reset_count = getattr(self, "_reset_count", 0) + 1
+            self._reset_count = last_generation + 1
         base = self.group_name.split("@reset", 1)[0]
-        self.group_name = f"{base}@{self._reset_count}"
+        self.group_name = f"{base}@reset{self._reset_count}"
         self.pyhccl = None
         return True
+
+    # Keep the historical misspelling as a compatibility alias for older
+    # callers; new Manager code uses the correctly named method above.
+    def force_destory_nccl_group(self, generation: int = None) -> bool:
+        return self.force_destroy_nccl_group(generation=generation)
 
     def init_process_group(self, rank: int, world_size: int, master_metadata: MasterMetadata):
         """Initialize the HCCL process group.

@@ -42,14 +42,18 @@ SUPPORTED_SCHEMA_VERSION = 1
 
 FIRST_ATTEMPT_ID = 1
 
+
 def _safe_component(name: str) -> str:
     return urllib.parse.quote(name, safe="._-")
+
 
 class PreflightError(RuntimeError):
     """Raised when the persist root cannot be created / written / read."""
 
+
 class WriteRejectedError(RuntimeError):
     """Raised when a checkpoint snapshot cannot be written durably."""
+
 
 @dataclass
 class _AttemptRecord:
@@ -63,7 +67,8 @@ class _AttemptRecord:
     finished_reason: Optional[str]
     status: str
     updated_at: float
-    gc_eligible_at : Optional[float]
+    gc_eligible_at: Optional[float]
+
 
 @dataclass
 class _RecoverySlot:
@@ -71,6 +76,7 @@ class _RecoverySlot:
     recovery_id: str
     attempts: dict[int, _AttemptRecord]
     latest_attempt_id: int = 0
+
 
 class RolloutProgressStore:
     def __init__(self, config: Optional[ProgressConfig] = None) -> None:
@@ -131,7 +137,7 @@ class RolloutProgressStore:
             except Exception:
                 self._write_failed += 1
                 logger.exception("[progress-store] shutdown drain failed for %s/%s/%s",
-                    payload.run_id, payload.recovery_id, payload.attempt_id)
+                                 payload.run_id, payload.recovery_id, payload.attempt_id)
             finally:
                 self._clear_pending(key)
         for t in self._tasks:
@@ -159,11 +165,11 @@ class RolloutProgressStore:
         self._write_queue.put_nowait(payload)
 
     async def load_latest(
-        self,
-        run_id: str,
-        recovery_id: str,
-        requested_model_version: Optional[str],
-        policy: ModelVersionPolicy,
+            self,
+            run_id: str,
+            recovery_id: str,
+            requested_model_version: Optional[str],
+            policy: ModelVersionPolicy,
     ) -> LoadResult:
         self._ensure_started()
         async with self._lock:
@@ -258,7 +264,7 @@ class RolloutProgressStore:
                 "dropped_pending": self._dropped_pending,
                 "revision": self._revision,
                 "recoveries": len(self._index),
-                "gc":copy.deepcopy(self._stats),
+                "gc": copy.deepcopy(self._stats),
             }
 
     def _ensure_started(self) -> None:
@@ -278,8 +284,8 @@ class RolloutProgressStore:
             except Exception:
                 self._write_failed += 1
                 logger.exception("[progress-store] save failed for %s/%s/%s",
-                    payload.run_id, payload.recovery_id, payload.attempt_id
-                )
+                                 payload.run_id, payload.recovery_id, payload.attempt_id
+                                 )
             finally:
                 self._clear_pending(key)
 
@@ -287,14 +293,14 @@ class RolloutProgressStore:
         slot = self._index.get((payload.run_id, payload.recovery_id))
         if slot is not None and payload.attempt_id < slot.latest_attempt_id:
             logger.warning("[progress-store] dropping stale attempt %s/%s/%s, latest = %s",
-                payload.run_id, payload.recovery_id, payload.attempt_id, slot.latest_attempt_id
-            )
+                           payload.run_id, payload.recovery_id, payload.attempt_id, slot.latest_attempt_id
+                           )
             return
         attempt_dir = (self._root
                        / _safe_component(payload.run_id)
                        / _safe_component(payload.recovery_id)
                        / str(payload.attempt_id)
-        )
+                       )
         tmp_dir = Path(f"{attempt_dir}.tmp")
         try:
             if tmp_dir.exists():
@@ -313,10 +319,20 @@ class RolloutProgressStore:
                 await self._write_shard(tmp_dir / ROUTING_BIN, pickle.dumps(payload.cumulative_routed_experts))
             manifest = self._build_manifest(payload)
             await self._write_shard(tmp_dir / MANIFEST, json.dumps(manifest).encode("utf-8"))
-            os.replace(tmp_dir, attempt_dir)
+            if attempt_dir.exists():
+                stale_dir = Path(f"{attempt_dir}.old")
+                shutil.rmtree(stale_dir, ignore_errors=True)
+                os.replace(attempt_dir, stale_dir)
+                try:
+                    os.replace(tmp_dir, attempt_dir)
+                except OSError:
+                    os.replace(stale_dir, attempt_dir)
+                    raise
+                shutil.rmtree(stale_dir, ignore_errors=True)
+            else:
+                os.replace(tmp_dir, attempt_dir)
         except (OSError, asyncio.TimeoutError) as e:
             shutil.rmtree(tmp_dir, ignore_errors=True)
-            # 失败统一由调用方（写循环 / shutdown 排水）计数，避免双层计数。
             raise WriteRejectedError(str(e)) from e
         self._commit_revision(payload, durable_offset=len(payload.cumulative_token_ids))
 
@@ -480,7 +496,7 @@ class RolloutProgressStore:
                     recovery_id = manifest.get("recovery_id")
                     if not run_id or not recovery_id or manifest.get("attempt_id") != attempt_id:
                         logger.warning(
-                            "[progress-store] skip inconsistent manifest %s",attempt_dir / MANIFEST,
+                            "[progress-store] skip inconsistent manifest %s", attempt_dir / MANIFEST,
                         )
                         continue
                     finished = bool(manifest.get("finished", False))
@@ -526,7 +542,7 @@ class RolloutProgressStore:
                         pass
                 shutil.rmtree(path)
             return total
-        
+
         try:
             freed = await asyncio.wait_for(
                 asyncio.get_running_loop().run_in_executor(None, _rm),
@@ -539,12 +555,13 @@ class RolloutProgressStore:
     async def _clean_orphan_tmp(self) -> int:
         def _scan() -> int:
             removed = 0
-            for p in self._root.rglob("*.tmp"):
-                try:
-                    shutil.rmtree(p)
-                    removed += 1
-                except OSError:
-                    pass
+            for pattern in ("*.tmp", "*.old"):
+                for p in self._root.rglob(pattern):
+                    try:
+                        shutil.rmtree(p)
+                        removed += 1
+                    except OSError:
+                        pass
             return removed
 
         return await asyncio.get_running_loop().run_in_executor(None, _scan)

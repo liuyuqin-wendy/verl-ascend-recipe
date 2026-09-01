@@ -328,7 +328,7 @@ class LLMServerClient:
                 return output, server_id
             except Exception as e:
                 if translate_fault and is_transient_fault(e):
-                    self._mark_server_failed(server_id)
+                    await self._mark_server_failed(server_id)
                     raise ServerUnavailable(server_id, cause=e) from e
                 raise
         finally:
@@ -574,11 +574,23 @@ class RetryLLMServerClient(LLMServerClient):
                 self._last_global_step = gs
             if progress_on and progress_ctx is not None:
                 cp = progress_ctx.checkpoint
+                inherited_ids = list(cp.cumulative_token_ids)
+                new_ids = list(output.token_ids)
+                lp_inherited = list(cp.cumulative_log_probs) if cp.cumulative_log_probs else []
+                lp_new = list(output.log_probs) if output.log_probs else []
+                re_inherited = cp.cumulative_routed_experts
+                re_new = output.routed_experts
+                if re_inherited is not None and re_new is not None:
+                    routed_experts = torch.cat([re_inherited, re_new], dim=0)
+                elif re_new is not None:
+                    routed_experts = re_new
+                else:
+                    routed_experts = re_inherited
                 final = TokenOutput(
-                    token_ids = list(cp.cumulative_token_ids),
-                    log_probs = list(cp.cumulative_log_probs) if cp.cumulative_log_probs else [],
-                    routed_experts = cp.cumulative_routed_experts,
-                    num_preempted = cp.num_preempted,
+                    token_ids = inherited_ids + new_ids,
+                    log_probs = (lp_inherited + lp_new) or None,
+                    routed_experts = routed_experts,
+                    num_preempted = (cp.num_preempted or 0) + (output.num_preempted or 0),
                     stop_reason = output.stop_reason,
                     extra_fields = dict(output.extra_fields),
                 )
@@ -778,15 +790,25 @@ class FullyLLMServerClient(LLMServerClient):
 
             # 2. merge output into final_output
             if progress_on and checkpoint is not None:
-                # Mode C: checkpoint.cumulative is the single source of truth
-                # (ingest during stream extended it with inherited + new tokens).
-                final_output.token_ids = list(checkpoint.cumulative_token_ids)
+                # Mode C: under the copy model the client-side checkpoint only
+                # carries the inherited prefix (the server ingests a serialized
+                # copy and does not mutate this object), so append the new tokens
+                # returned by this attempt.
+                final_output.token_ids = list(checkpoint.cumulative_token_ids) + list(output.token_ids)
                 if checkpoint.cumulative_log_probs is not None:
-                    final_output.log_probs = list(checkpoint.cumulative_log_probs)
+                    final_output.log_probs = list(checkpoint.cumulative_log_probs) + list(output.log_probs or [])
                 else:
-                    final_output.log_probs = []
-                final_output.routed_experts = checkpoint.cumulative_routed_experts
-                final_output.num_preempted = checkpoint.num_preempted
+                    final_output.log_probs = list(output.log_probs or [])
+                if checkpoint.cumulative_routed_experts is not None:
+                    if output.routed_experts is not None:
+                        final_output.routed_experts = torch.cat(
+                            [checkpoint.cumulative_routed_experts, output.routed_experts], dim=0
+                        )
+                    else:
+                        final_output.routed_experts = checkpoint.cumulative_routed_experts
+                else:
+                    final_output.routed_experts = output.routed_experts
+                final_output.num_preempted = (checkpoint.num_preempted or 0) + (output.num_preempted or 0)
                 final_output.stop_reason = output.stop_reason
             else:
                 # Mode B: extend final_output with this attempt's new tokens
@@ -1052,7 +1074,7 @@ class LLMServerManager:
         # replicas that window can otherwise surface as ActorAlreadyExistsError
         # while creating a worker on a non-zero local rank (for example
         # ``...CheckpointEngineWorker0:1``).
-        recovery_suffix = f"_recovery_{uuid4().hex}"
+        recovery_suffix = f"recovery_{uuid4().hex}"
         new_replica = self.rollout_replica_class(
             replica_rank=dead_rank,
             config=self.rollout_config,
@@ -1121,7 +1143,7 @@ class LLMServerManager:
             self.rollout_config.tensor_model_parallel_size
             * self.rollout_config.data_parallel_size
             * self.rollout_config.pipeline_model_parallel_size
-        )
+        ) // nnodes
         required_accelerators = rollout_world_size
         loop = asyncio.get_running_loop()
         deadline = loop.time() + 180.0

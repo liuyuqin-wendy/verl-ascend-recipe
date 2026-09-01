@@ -130,6 +130,10 @@ class vLLMHttpServer:
         self.nnodes = nnodes
         # model weights version, set by ServerAdapter when update weights.
         self.global_steps = None
+        # Server-side version fence prevents a late old adapter from changing
+        # the visible model version after a newer sync attempt has started.
+        self._weight_sync_attempt_id: int | None = None
+        self._weight_sync_target_version: int | None = None
 
         if self.rollout_mode != RolloutMode.HYBRID and self.config.load_format == "dummy":
             logger.warning(f"rollout mode is {self.rollout_mode}, load_format is dummy, set to auto")
@@ -539,7 +543,7 @@ class vLLMHttpServer:
         # Final flush: ensure terminal fields (finished/finish_reason) are persisted.
         # ``ingest`` already force-flushes on finished=True, but guard against the
         # edge case where the last chunk did not set finished before the loop exited.
-        if progress_ctx is not None and not progress_ctx.checkpoint.is_terminal():
+        if progress_ctx is not None:
             progress_ctx.checkpoint.ingest(final_res)
             progress_ctx.checkpoint._maybe_flush(force=True)
 
@@ -623,8 +627,31 @@ class vLLMHttpServer:
         if self.node_rank == 0:
             await self.engine.reset_prefix_cache()
 
-    async def set_global_steps(self, global_steps: int):
+    async def begin_weight_sync(self, attempt_id: int, target_version: int | None = None) -> bool:
+        """Open a monotonic sync context for this server actor."""
+        if (
+            self._weight_sync_attempt_id is not None
+            and attempt_id < self._weight_sync_attempt_id
+        ):
+            return False
+        if (
+            self._weight_sync_attempt_id == attempt_id
+            and self._weight_sync_target_version != target_version
+        ):
+            return False
+        self._weight_sync_attempt_id = attempt_id
+        self._weight_sync_target_version = target_version
+        return True
+
+    async def set_global_steps(self, global_steps: int, attempt_id: int | None = None):
         """Set the global steps of the model weights."""
+        if attempt_id is not None and (
+            attempt_id != self._weight_sync_attempt_id
+            or global_steps != self._weight_sync_target_version
+        ):
+            from verl.workers.rollout.vllm_rollout.bucketed_weight_transfer import StaleWeightSyncAttempt
+
+            raise StaleWeightSyncAttempt(attempt_id, global_steps)
         self.global_steps = global_steps
 
     async def wait_for_requests_to_drain(self):

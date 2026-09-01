@@ -79,19 +79,18 @@ class VLLMProgressCheckPoint:
         accounting. Idempotent: repeated ingestion of the same chunk is a
         no-op because ``len(cumulative)`` already covers it.
         """
-        if self.is_terminal():
-            return
-
         output = request_output.outputs[0]
         all_ids: list[int] = list(output.token_ids)
-        prev_len = len(self.cumulative_token_ids)
+
+        inherited = self.cumulative_token_ids[: self.inherited_prefix_len]
+        prev_new = len(self.cumulative_token_ids) - self.inherited_prefix_len
+        new_count = len(all_ids) - prev_new
 
         # vLLM shouldn't shrink token_ids, but be defensive.
-        if len(all_ids) < prev_len:
+        if new_count <= 0:
             return
 
-        new_count = len(all_ids) - prev_len
-        self.cumulative_token_ids = all_ids
+        self.cumulative_token_ids = inherited + all_ids
 
         # logprobs: list[dict[token_id, Logprob]]; rebuild cumulative list.
         logprobs = getattr(output, "logprobs", None)
@@ -100,17 +99,25 @@ class VLLMProgressCheckPoint:
             for i, lp_dict in enumerate(logprobs):
                 if i >= len(self.cumulative_token_ids):
                     break
-                tid = self.cumulative_token_ids[i]
+                tid = all_ids[i]
                 if lp_dict and tid in lp_dict:
                     rebuilt.append(float(lp_dict[tid].logprob))
                 else:
                     rebuilt.append(0.0)
-            self.cumulative_log_probs = rebuilt
+            if self.cumulative_log_probs is not None:
+                self.cumulative_log_probs = (list(self.cumulative_log_probs[: self.inherited_prefix_len]) + rebuilt)
+            else:
+                self.cumulative_log_probs = rebuilt
 
         # routed_experts: cumulative per-token tensor (optional).
         routed = getattr(output, "routed_experts", None)
         if routed is not None:
-            self.cumulative_routed_experts = routed
+            if self.cumulative_routed_experts is not None and self.inherited_prefix_len > 0:
+                import torch
+                inherited_routed = self.cumulative_routed_experts[: self.inherited_prefix_len]
+                self.cumulative_routed_experts = torch.cat([inherited_routed, routed], dim=0)
+            else:
+                self.cumulative_routed_experts = routed
 
         self.finished = bool(getattr(output, "finished", False))
         self.finished_reason = getattr(output, "finish_reason", None)
@@ -121,9 +128,7 @@ class VLLMProgressCheckPoint:
         self.updated_at = time.time()
         self._tokens_since_last_flush += new_count
 
-        if self.finished:
-            self._maybe_flush(force=True)
-        elif self.flush_token_interval > 0 and self._tokens_since_last_flush >= self.flush_token_interval:
+        if 0 < self.flush_token_interval <= self._tokens_since_last_flush:
             self._maybe_flush()
 
     # ------------------------------------------------------------------ flush

@@ -1039,6 +1039,9 @@ class AgentLoopManager:
                     continue
                 outputs.append(r)
             if not outputs:
+                first = results[0] if results else None
+                if isinstance(first, BaseException):
+                    raise RuntimeError(f"[FT] all agent loop workers failed, first error: {first}") from first
                 raise RuntimeError("[FT] all agent loop workers failed; nothing to concat")
         else:
             outputs = await asyncio.gather(*worker_futures)

@@ -173,7 +173,8 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         self.actor_rollout_wg = None
         self.async_rollout_manager = None
 
-        # Fault tolerance (initialized in init_ft_supervisor)
+        # Fault tolerance is constructed before the trainer's first sync and
+        # started by init_ft_supervisor so CKE-first failures are reportable.
         self._ft_supervisor = None
         self._trainer_handle = None
 
@@ -476,8 +477,8 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         # replica_id = _server_address (matches LB's server_id keying)
         replica_map = {r._server_address: r for r in replicas}
 
-        # Cross-actor CKE callback: notify Trainer to prune dead replica + set
-        # membership_changed so the next update_weights rebuilds NCCL group.
+        # Cross-actor callback: notify Trainer so its CKE prunes the dead
+        # replica. The Manager owns all communication-group reset decisions.
         async def ckpt_mgr_callback(replica_id):
             if self._trainer_handle is None:
                 return
@@ -499,20 +500,12 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
                 return await self.llm_server_manager.spawn_replacement(dead_id)
 
             async def on_spawn_success_fn(dead_id, new_replica):  # noqa: E306
-                # Order: Trainer.CKE.add → Trainer.membership_changed → LB.add → Supervisor.add
-                if self._trainer_handle is not None:
-                    try:
-                        ref = self._trainer_handle._on_replica_added_from_supervisor.remote(new_replica)
-                        await asyncio.wrap_future(ref.future())
-                    except Exception as e:
-                        _ft_log.warning(
-                            "[FT] on_spawn_success: failed to notify trainer of replica add %s: %s",
-                            new_replica._server_address,
-                            e,
-                        )
-                await self.llm_server_manager.global_load_balancer.add_servers.remote(
-                    {new_replica._server_address: new_replica._server_handle}
-                )
+                # Register as pending first; Manager promotes it after a full
+                # sync at the current target version, then LB admission is safe.
+                if self._trainer_handle is None:
+                    raise RuntimeError("trainer handle is unavailable while registering a replacement replica")
+                ref = self._trainer_handle._on_replica_added_from_supervisor.remote(new_replica)
+                await asyncio.wrap_future(ref.future())
                 sup = getattr(self, "_ft_supervisor", None)
                 if sup is not None:
                     sup.supervisor.add_replica(new_replica._server_address, new_replica)
@@ -528,21 +521,54 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
             spawner=spawner_fn,
             on_spawn_success=on_spawn_success_fn,
         )
+
+        async def promote_fn(servers):
+            await self.llm_server_manager.global_load_balancer.add_servers.remote(servers)
+
         inner_sup = Supervisor(
             replicas=replica_map,
             probe_fn=probe_fn,
             on_dead=on_dead_handler,
+            promote_fn=promote_fn,
             interval_s=ft_cfg.heartbeat_interval_s,
             miss_threshold=ft_cfg.heartbeat_miss_threshold,
             probe_timeout_s=2.0,
         )
         # Own thread+loop so rollouter's blocking operations can't starve heartbeat.
         self._ft_supervisor = ThreadedSupervisor(inner_sup)
+        # The fully-async main performs its initial parameter sync immediately
+        # after this method returns, so heartbeat/reporting must already run.
+        self._ft_supervisor.start()
         _ft_log.warning(
-            "[FT] init_ft_supervisor: ThreadedSupervisor created with %d replicas, interval=%s miss_threshold=%s",
+            "[FT] init_ft_supervisor: ThreadedSupervisor started with %d replicas, interval=%s miss_threshold=%s",
             len(replica_map),
             ft_cfg.heartbeat_interval_s,
             ft_cfg.heartbeat_miss_threshold,
+        )
+
+    def report_sync_failure(self, replica_id: str, source: str = "unknown") -> None:
+        """Forward a CKE sync failure to the rollouter-owned Supervisor."""
+        supervisor = getattr(self, "_ft_supervisor", None)
+        if supervisor is None:
+            return
+        supervisor.report_failure(replica_id, source)
+
+    async def promote_synced_replica(
+        self,
+        replica_id: str,
+        servers: dict,
+        attempt_id: int,
+        target_version: int,
+    ) -> bool:
+        """Serialize serving admission with Supervisor death handling."""
+        supervisor = getattr(self, "_ft_supervisor", None)
+        if supervisor is None:
+            return False
+        return await supervisor.promote_replica(
+            replica_id,
+            servers,
+            attempt_id,
+            target_version,
         )
 
     async def _create_reward_loop_manager(self):
@@ -617,12 +643,72 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
 
         self.async_rollout_mode = True
         self.llm_server_manager = await LLMServerManager.create(config=self.config)
+        await self._init_fully_async_progress()
         self.async_rollout_manager = await FullyAsyncAgentLoopManager.create(
             config=self.config,
             llm_client=self.llm_server_manager.get_client(fully_async=True),
             reward_loop_worker_handles=reward_loop_worker_handles,
             teacher_client=self.teacher_model_manager.get_client() if self.teacher_model_manager else None,
         )
+
+    async def _init_fully_async_progress(self):
+        """Mode C: create + initialise the RolloutProgressStoreActor if enabled.
+
+        Mirrors one_step_off_policy's _init_one_step_progress. Only runs when both
+        ``async_training.fault_tolerance.enabled`` and
+        ``async_training.fault_tolerance.progress.enabled`` are True. The store handle
+        is wired into every FullyLLMServerClient produced by
+        ``llm_server_manager.get_client(fully_async=True)``, which is what turns on the
+        token-continuation retry path.
+        """
+        import logging as _ft_logging
+
+        from omegaconf import OmegaConf
+
+        try:
+            ft_enabled = bool(
+                OmegaConf.select(self.config, "async_training.fault_tolerance.enabled", default=False)
+            )
+            progress_enabled = bool(
+                OmegaConf.select(self.config, "async_training.fault_tolerance.progress.enabled", default=False)
+            )
+        except Exception as e:
+            _ft_logging.getLogger(__name__).warning("[FT] init fully-async progress failed: %s", e)
+            return
+        if not ft_enabled or not progress_enabled:
+            _ft_logging.getLogger(__name__).info(
+                "[FT] fully-async token continuation skipped (ft.enabled=%s, progress.enabled=%s)",
+                ft_enabled,
+                progress_enabled,
+            )
+            return
+
+        from verl.workers.rollout.fault_tolerance import ModelVersionPolicy, ProgressConfig
+
+        progress_node = OmegaConf.select(self.config, "async_training.fault_tolerance.progress")
+        progress_config = self._build_progress_config(progress_node)
+        await self.llm_server_manager._init_progress_store(progress_config)
+        _ft_logging.getLogger(__name__).info(
+            "[FT] fully-async Mode C (token continuation) enabled: run_id=%s, persist_root=%s",
+            self.llm_server_manager.run_id,
+            progress_config.persist_root,
+        )
+
+    def _build_progress_config(self, progress_node):
+        """Map the config ``progress`` node onto a ProgressConfig dataclass."""
+        from omegaconf import OmegaConf
+
+        from verl.workers.rollout.fault_tolerance import ModelVersionPolicy, ProgressConfig
+
+        if progress_node is None:
+            return ProgressConfig()
+        kwargs = {}
+        for key, value in OmegaConf.to_container(progress_node, resolve=True).items():
+            if key == "model_version_policy" and isinstance(value, dict):
+                kwargs[key] = ModelVersionPolicy(mode=value.get("mode", "exact"))
+            else:
+                kwargs[key] = value
+        return ProgressConfig(**kwargs)
 
     # Add samples to the pending_queue
     async def _feed_samples(self):
@@ -832,12 +918,16 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         if self.message_queue_client is None:
             raise ValueError("MessageQueue client not set. Call set_message_queue_client() first.")
 
-        # FT: start Supervisor heartbeat before generation begins
+        # The Supervisor normally started in init_ft_supervisor, before the
+        # trainer's initial sync. Keep a guarded fallback for direct callers.
         if getattr(self, "_ft_supervisor", None) is not None:
             import logging as _ft_logging
 
-            _ft_logging.getLogger(__name__).warning("[FT] fit: starting Supervisor heartbeat")
-            self._ft_supervisor.start()
+            if not self._ft_supervisor.is_running:
+                _ft_logging.getLogger(__name__).warning("[FT] fit: starting Supervisor heartbeat")
+                self._ft_supervisor.start()
+            else:
+                _ft_logging.getLogger(__name__).debug("[FT] fit: Supervisor heartbeat already running")
         else:
             import logging as _ft_logging
 

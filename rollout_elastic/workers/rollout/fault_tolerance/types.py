@@ -40,6 +40,12 @@ class FaultToleranceConfig:
     weight_sync_member_timeout_s: float = 60.0
     """Per-ref timeout in build_process_group; dropping dead members."""
 
+    weight_sync_transfer_timeout_s: float = 600.0
+    """Total timeout for transferring one complete model to rollout replicas."""
+
+    max_weight_sync_retries: int = 2
+    """Max N-1 replay attempts after a transient rollout-side sync failure."""
+
     # ----- P2 Supervisor -----
     heartbeat_interval_s: float = 5.0
     """Supervisor heartbeat period."""
@@ -51,11 +57,11 @@ class FaultToleranceConfig:
     """If True (standalone mode only), supervisor spawns replacement on dead."""
 
     # ----- Token continuation sub-config -----
-    progress: "ProgressConfig" = field(default_factory=lambda: _default_progress_config())
+    progress: ProgressConfig = field(default_factory=lambda: _default_progress_config())
     """Token 续推子配置. 当 ``progress.enabled=True`` 且 ``enabled=True`` 时启用."""
 
 
-def _default_progress_config() -> "ProgressConfig":
+def _default_progress_config() -> ProgressConfig:
     """Late import to avoid circular dependency at module load time."""
     from verl.workers.rollout.fault_tolerance.progress.types import ProgressConfig
     return ProgressConfig()

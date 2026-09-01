@@ -47,6 +47,41 @@ class ThreadedSupervisor:
     def supervisor(self) -> Supervisor:
         return self._supervisor
 
+    @property
+    def is_running(self) -> bool:
+        """Whether the dedicated heartbeat thread is currently alive."""
+        return self._thread is not None and self._thread.is_alive()
+
+    def report_failure(self, replica_id: str, source: str = "unknown") -> None:
+        """Thread-safe, non-blocking bridge for CKE sync-stage failures."""
+        loop = self._loop
+        if loop is None or not loop.is_running():
+            self._log.debug(
+                "[FT] ThreadedSupervisor.report_failure ignored before loop start: %s (%s)",
+                replica_id,
+                source,
+            )
+            return
+        loop.call_soon_threadsafe(self._supervisor.report_failure, replica_id, source)
+
+    async def promote_replica(
+        self,
+        replica_id: str,
+        servers: dict[str, object],
+        attempt_id: int,
+        target_version: int,
+    ) -> bool:
+        """Run serving admission on the Supervisor loop and await its decision."""
+        del attempt_id, target_version
+        loop = self._loop
+        if loop is None or not loop.is_running():
+            return False
+        future = asyncio.run_coroutine_threadsafe(
+            self._supervisor.promote_replica(replica_id, servers),
+            loop,
+        )
+        return bool(await asyncio.wrap_future(future))
+
     def start(self, ready_timeout_s: float = 10.0) -> None:
         if self._thread is not None:
             raise RuntimeError("ThreadedSupervisor already started")

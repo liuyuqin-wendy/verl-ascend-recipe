@@ -236,6 +236,7 @@ class RolloutReplica(ABC):
             rollout_config=self.config,
             model_config=self.model_config,
             replica_rank=self.replica_rank,
+            name_suffix=self.name_suffix,
         )
 
     @abstractmethod

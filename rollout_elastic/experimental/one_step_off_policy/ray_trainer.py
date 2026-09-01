@@ -324,18 +324,24 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
 
         self.global_steps = 0
 
-        # load checkpoint and update weights before doing anything
+        # Load the checkpoint before the first sync. Supervisor must already
+        # be alive so a CKE-first rollout failure can be reported immediately.
         self._load_checkpoint()
-        self._fit_update_weights()
-
-        # FT: start Supervisor heartbeat after initial weight sync, before training loop
         if getattr(self, "_ft_supervisor", None) is not None:
             import logging as _ft_logging
-            _ft_logging.getLogger(__name__).warning("[FT] fit: starting Supervisor heartbeat")
+
+            _ft_logging.getLogger(__name__).warning("[FT] fit: starting Supervisor heartbeat before initial sync")
             self._ft_supervisor.start()
         else:
             import logging as _ft_logging
             _ft_logging.getLogger(__name__).warning("[FT] fit: _ft_supervisor is None — no FT detection")
+
+        try:
+            self._fit_update_weights()
+        except BaseException:
+            if getattr(self, "_ft_supervisor", None) is not None:
+                self._ft_supervisor.stop()
+            raise
 
         # perform validation before training
         # currently, we only support validation using the reward_function.

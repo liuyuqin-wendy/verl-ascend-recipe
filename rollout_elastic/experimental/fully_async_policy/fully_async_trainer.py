@@ -229,6 +229,19 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             replicas=replicas,
             fault_tolerance=ft_cfg,
             load_balancer_handle=lb_handle,
+            sync_failure_reporter=(
+                lambda replica_id, source: rollouter.report_sync_failure.remote(replica_id, source)
+            ),
+            replica_promotion_reporter=(
+                lambda replica_id, servers, attempt_id, target_version: (
+                    rollouter.promote_synced_replica.remote(
+                        replica_id,
+                        servers,
+                        attempt_id,
+                        target_version,
+                    )
+                )
+            ),
         )
         print("[FullyAsyncTrainer] Checkpoint manager initialized")
 
@@ -254,13 +267,11 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
     async def _on_replica_added_from_supervisor(self, new_replica):
         """Cross-actor callback: Rollouter's Supervisor spawned a replacement.
 
-        Adds the new replica to the trainer-side CKE and marks membership dirty
-        so the next update_weights includes it in the NCCL group.
+        Register the replacement as pending.  The next complete weight-sync
+        transaction promotes it and only then admits it to the load balancer.
         """
         if self.checkpoint_manager is not None:
-            self.checkpoint_manager.add_replicas([new_replica])
-            with self.checkpoint_manager._dead_lock:
-                self.checkpoint_manager.membership_changed = True
+            self.checkpoint_manager.add_pending_replicas([new_replica])
 
     def set_total_train_steps(self, total_training_steps):
         self.total_train_steps = total_training_steps

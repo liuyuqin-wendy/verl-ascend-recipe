@@ -124,10 +124,12 @@ class NCCLCheckpointEngine(CheckpointEngine):
         self.group_name = group_name
         self.rebuild_group = rebuild_group
         self.rollout_dtype = rollout_dtype
+        self._reset_count = 0
+        self._group_initialized = False
 
         # start zeromq server for broadcasting bucket tensor metadata
         self.is_master = is_master
-        self.topic = "bucket_metadata"
+        self.topic = "bucket_metadata@reset0"
         if self.is_master:
             self._start_zmq_server()
 
@@ -143,10 +145,12 @@ class NCCLCheckpointEngine(CheckpointEngine):
 
         return MasterMetadata(zmq_ip=self.ip, zmq_port=self.listen_port) if self.is_master else None
 
-    def finalize(self):
+    def finalize(self, reset_generation: int | None = None):
         """Destroy the NCCL process group if rebuild_group is True."""
+        if reset_generation is not None and reset_generation < getattr(self, "_reset_count", 0):
+            return True
         if self.rebuild_group:
-            if self.rank >= 0:
+            if getattr(self, "rank", None) is not None and self.rank >= 0:
                 collective.destroy_collective_group(self.group_name)
             self.rank = None
             self.world_size = None
@@ -157,17 +161,30 @@ class NCCLCheckpointEngine(CheckpointEngine):
         torch.cuda.empty_cache()
 
     def force_destroy_nccl_group(self, generation: int = None) -> bool:
-        # Bump group_name suffix instead of calling destroy_collective_group
-        # (which would ncclCommDestroy-block on the dead peer).
+        """Invalidate the local communicator generation without peer sync.
+
+        Reset requests are idempotent and monotonic.  This matters when the
+        Supervisor and a sync-stage failure report the same replica: an older
+        callback must not move a worker back to a stale communicator name.
+        """
+        last_generation = getattr(self, "_reset_count", 0)
+        if generation is not None and int(generation) <= last_generation:
+            return True
         self.rank = None
         self.world_size = None
         if generation is not None:
             self._reset_count = int(generation)
         else:
-            self._reset_count = getattr(self, "_reset_count", 0) + 1
+            self._reset_count = last_generation + 1
         base = self.group_name.split("@reset", 1)[0]
         self.group_name = f"{base}@reset{self._reset_count}"
+        self.topic = f"bucket_metadata@reset{self._reset_count}"
+        self._group_initialized = False
         return True
+
+    def _capture_transfer_context(self):
+        """Freeze mutable generation state for one complete transfer coroutine."""
+        return self.group_name, self.topic, self.socket
 
     @classmethod
     def build_topology(cls, trainer_world_size: int, rollout_world_size: int, metadata: list[dict]):
@@ -255,6 +272,7 @@ class NCCLCheckpointEngine(CheckpointEngine):
             return
 
         send_buf, recv_buf = self.send_buf, self.recv_buf
+        group_name, topic, socket = self._capture_transfer_context()
         broadcast_op = None
 
         start_time = time.time()
@@ -271,11 +289,11 @@ class NCCLCheckpointEngine(CheckpointEngine):
 
                 broadcast_op = BroadcastOperation(
                     rank=self.rank,
-                    group_name=self.group_name,
+                    group_name=group_name,
                     bucket=send_buf,
                     metadata={"bucket_meta": bucket_meta, "is_last": False},
-                    socket=self.socket,
-                    topic=self.topic,
+                    socket=socket,
+                    topic=topic,
                 )
 
                 # swap send_buf and recv_buf
@@ -298,11 +316,11 @@ class NCCLCheckpointEngine(CheckpointEngine):
 
         broadcast_op = BroadcastOperation(
             rank=self.rank,
-            group_name=self.group_name,
+            group_name=group_name,
             bucket=send_buf,
             metadata={"bucket_meta": bucket_meta, "is_last": True},
-            socket=self.socket,
-            topic=self.topic,
+            socket=socket,
+            topic=topic,
         )
         await broadcast_op.wait_for_complete()
         logger.info(f"Rank {self.rank} send weights done, time cost: {time.time() - start_time:.2f}s")
@@ -325,17 +343,18 @@ class NCCLCheckpointEngine(CheckpointEngine):
         """
         assert self.rank > 0, "Rank 0 should not receive weights."
         send_buf, recv_buf = self.send_buf, self.recv_buf
+        group_name, topic, socket = self._capture_transfer_context()
         total_bytes, total_params = 0, 0
 
         # receive first bucket
         start_time = time.time()
         broadcast_op = BroadcastOperation(
             rank=self.rank,
-            group_name=self.group_name,
+            group_name=group_name,
             bucket=recv_buf,
             metadata=None,
-            socket=self.socket,
-            topic=self.topic,
+            socket=socket,
+            topic=topic,
         )
         metadata = await broadcast_op.wait_for_complete()
         total_bytes += self.bucket_size
@@ -347,11 +366,11 @@ class NCCLCheckpointEngine(CheckpointEngine):
             # 1. receive next bucket
             broadcast_op = BroadcastOperation(
                 rank=self.rank,
-                group_name=self.group_name,
+                group_name=group_name,
                 bucket=recv_buf,
                 metadata=None,
-                socket=self.socket,
-                topic=self.topic,
+                socket=socket,
+                topic=topic,
             )
 
             # 2. yield tensor from send_buf

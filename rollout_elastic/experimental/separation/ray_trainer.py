@@ -174,13 +174,9 @@ class SeparateRayPPOTrainer(RayPPOTrainer):
                     return await self.llm_server_manager.spawn_replacement(dead_id)
 
                 async def on_spawn_success_fn(dead_id, new_replica):  # noqa: E306
-                    # Order: CKE.add → membership_changed → LB.add → Supervisor.add
-                    self.checkpoint_manager.add_replicas([new_replica])
-                    with self.checkpoint_manager._dead_lock:
-                        self.checkpoint_manager.membership_changed = True
-                    await self.llm_server_manager.global_load_balancer.add_servers.remote(
-                        {new_replica._server_address: new_replica._server_handle}
-                    )
+                    # Keep a replacement out of the current sync/LB until a
+                    # complete weight transaction successfully commits it.
+                    self.checkpoint_manager.add_pending_replicas([new_replica])
                     sup = getattr(self, "_ft_supervisor", None)
                     if sup is not None:
                         sup.supervisor.add_replica(new_replica._server_address, new_replica)
@@ -196,16 +192,25 @@ class SeparateRayPPOTrainer(RayPPOTrainer):
                 spawner=spawner_fn,
                 on_spawn_success=on_spawn_success_fn,
             )
+
+            async def promote_fn(servers):
+                await self.llm_server_manager.global_load_balancer.add_servers.remote(servers)
+
             inner_sup = Supervisor(
                 replicas=replica_map,
                 probe_fn=probe_fn,
                 on_dead=on_dead_handler,
+                promote_fn=promote_fn,
                 interval_s=ft_cfg.heartbeat_interval_s,
                 miss_threshold=ft_cfg.heartbeat_miss_threshold,
                 probe_timeout_s=2.0,
             )
             # Own thread+loop so trainer-main blocking ray.get can't starve heartbeat.
             self._ft_supervisor = ThreadedSupervisor(inner_sup)
+            self.checkpoint_manager.set_sync_failure_reporter(self._ft_supervisor.report_failure)
+            self.checkpoint_manager.set_replica_promotion_reporter(
+                self._ft_supervisor.promote_replica
+            )
             logging.getLogger(__name__).warning(
                 "[FT] init_workers: ThreadedSupervisor created with %d replicas, interval=%s miss_threshold=%s",
                 len(replica_map), ft_cfg.heartbeat_interval_s, ft_cfg.heartbeat_miss_threshold,
