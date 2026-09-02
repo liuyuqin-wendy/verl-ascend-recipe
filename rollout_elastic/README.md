@@ -64,11 +64,10 @@ python3 -m verl.experimental.fully_async_policy.fully_async_main \
     rollout.n_gpus_per_node=8
 
 # 4. one-step-off
-python3 -m verl.trainer.main_ppo \
+python3 -m verl.experimental.one_step_off_policy.main_ppo \
     --config-path=config --config-name='one_step_off_ppo_trainer' \
     actor_rollout_ref.model.path=<MODEL_PATH> \
-    data.train_files=<TRAIN_FILES> \
-    trainer.trainer_fn=verl.experimental.one_step_off_policy.ray_trainer.OneStepOffRayTrainer
+    data.train_files=<TRAIN_FILES>
 ```
 
 `VERL_USE_EXTERNAL_MODULES` is verl's native external-module hook: setting it to
