@@ -63,6 +63,9 @@ def filter_partial_batch(
         if isinstance(r, _PROMPT_FAULT_TYPES):
             fault_count += 1
             continue
+        if is_transient_fault(r):
+            fault_count += 1
+            continue
         if isinstance(r, BaseException):
             raise r
         ok_outputs.append(r)
