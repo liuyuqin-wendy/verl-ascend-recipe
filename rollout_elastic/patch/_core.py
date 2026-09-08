@@ -81,7 +81,7 @@ def _register_actor_method(target: type, name: str, method: Callable) -> None:
     Idempotent: an existing entry is left untouched.
     """
     method_meta = _ray_method_meta(target)
-    if method_meta is None or name in method_meta.methods:
+    if method_meta is None:
         return
     from ray._common.signature import extract_signature
 

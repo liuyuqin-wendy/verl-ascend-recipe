@@ -55,12 +55,38 @@ def _apply_area(name: str) -> None:
     importlib.import_module(f"{__package__}.{name}")
 
 
+def _probe(where: str) -> None:
+    """Diagnostic probe: identify the process applying patches.
+
+    Temporary debugging aid for the "LB actor is bare" issue — remove once
+    resolved. Matches processes by ``pid``/``host`` in Ray worker logs.
+    """
+    import os
+    import socket
+
+    try:
+        import ray
+
+        lcl = getattr(ray._private.worker.global_worker, "load_code_from_local", None)
+    except Exception:
+        lcl = "<no-ray-worker>"
+    logger.warning(
+        "rollout_elastic probe[%s]: pid=%s host=%s VERL_USE_EXTERNAL_MODULES=%r load_code_from_local=%s",
+        where,
+        os.getpid(),
+        socket.gethostname(),
+        os.getenv("VERL_USE_EXTERNAL_MODULES"),
+        lcl,
+    )
+
+
 def install(areas: Iterable[str] | None = None) -> None:
     """Apply all rollout_elastic patches to the running verl process.
 
     Args:
         areas: Optional subset of area names to apply (defaults to all).
     """
+    _probe("install")
     mount_fault_tolerance()
     for name in _AREA_MODULES if areas is None else areas:
         try:

@@ -78,6 +78,20 @@ def _lb_init(
     enable_fault_tolerance: bool = False,
 ):
     """Initialize the LB around the recipe-owned ``_LoadBalancerCore``."""
+    # Diagnostic probe for the "LB actor is bare" issue — remove once resolved.
+    # Runs inside the LB actor process at actor construction. If this line never
+    # appears in the logs, the actor class snapshot was the bare native one.
+    try:
+        _lcl = getattr(ray._private.worker.global_worker, "load_code_from_local", None)
+    except Exception:
+        _lcl = "<no-ray-worker>"
+    logger.warning(
+        "rollout_elastic probe[lb_init]: pid=%s host=%s VERL_USE_EXTERNAL_MODULES=%r load_code_from_local=%s",
+        os.getpid(),
+        socket.gethostname(),
+        os.getenv("VERL_USE_EXTERNAL_MODULES"),
+        _lcl,
+    )
     from verl.workers.rollout.fault_tolerance.load_balancer import _LoadBalancerCore
 
     orig(self, servers, max_cache_size=max_cache_size)
@@ -86,7 +100,7 @@ def _lb_init(
         max_cache_size=max_cache_size,
         enable_fault_tolerance=enable_fault_tolerance,
     )
-    setattr(self, _ORIG_LB, True)
+    setattr(self, _ORIG_LB, self._core)
 
 
 def _lb_core(self):
