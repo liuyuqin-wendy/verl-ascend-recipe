@@ -14,8 +14,8 @@
 """Plain-Python load-balancer state machine for elastic rollout.
 
 ``_LoadBalancerCore`` is a new class kept in the recipe (it does not exist in
-verl@dfc01f85). It is wrapped by verl's native ``GlobalRequestLoadBalancer``
-Ray actor via the ``patch.llm_server`` decorators, so the state machine is
+verl@dfc01f85). It is wrapped by the recipe-owned ``ElasticGlobalRequestLoadBalancer``
+Ray actor defined in ``patch.llm_server``, so the state machine is
 unit-testable without ``ray.init()``.
 """
 
@@ -29,7 +29,7 @@ DEFAULT_ROUTING_CACHE_SIZE = 10000
 class _LoadBalancerCore:
     """Plain-Python state machine for load balancing.
 
-    Wrapped by `GlobalRequestLoadBalancer` (Ray actor) for remote access.
+    Wrapped by `ElasticGlobalRequestLoadBalancer` (Ray actor) for remote access.
     Splitting the logic from the Ray decorator makes it unit-testable without
     `ray.init()`, while keeping the Ray actor as a thin forwarder.
 

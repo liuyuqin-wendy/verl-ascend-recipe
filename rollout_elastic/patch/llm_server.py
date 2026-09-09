@@ -13,9 +13,9 @@
 # limitations under the License.
 """Patch ``verl.workers.rollout.llm_server`` for elastic inference.
 
-This area extends the four native classes of ``llm_server.py``:
+This area replaces the LB actor and extends the native client/manager classes:
 
-- ``GlobalRequestLoadBalancer`` (Ray actor): rewritten as a thin forwarder over
+- ``ElasticGlobalRequestLoadBalancer`` (recipe-owned Ray actor): forwards to
   the recipe-owned ``_LoadBalancerCore`` state machine (kept in
   ``fault_tolerance.load_balancer``), which adds fault tolerance
   (``mark_failed``, dead-set routing) and real ``add_servers`` /
@@ -29,9 +29,9 @@ This area extends the four native classes of ``llm_server.py``:
   ``RolloutProgressStoreActor``, and can spawn replacement replicas
   (``spawn_replacement`` / ``_reclaim_ray_resources``).
 
-``_LoadBalancerCore`` and ``RetryLLMServerClient`` are brand-new classes and are
-kept as recipe files under ``fault_tolerance``; everything else is expressed as
-decorators against the native classes.
+The LB actor is defined completely before Ray decorates it. The core and retry
+client live under ``fault_tolerance``; native clients and the manager are extended
+through decorators.
 """
 
 from __future__ import annotations
@@ -52,7 +52,6 @@ from verl.utils.tokenizer import normalize_token_ids
 from verl.workers.rollout.llm_server import (
     DEFAULT_ROUTING_CACHE_SIZE,
     FullyLLMServerClient,
-    GlobalRequestLoadBalancer,
     LLMServerClient,
     LLMServerManager,
 )
@@ -63,97 +62,56 @@ from ._core import add, patch, wrap
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# GlobalRequestLoadBalancer (Ray actor) — thin forwarder over _LoadBalancerCore
+# Recipe-owned LB actor — all methods are defined before Ray wraps the class
 # ---------------------------------------------------------------------------
 
-_ORIG_LB = "_rollout_elastic_lb_core"
 
+@ray.remote
+class ElasticGlobalRequestLoadBalancer:
+    """Global routing and fault state shared by all recipe clients."""
 
-@wrap(GlobalRequestLoadBalancer, "__init__")
-def _lb_init(
-    orig,
-    self,
-    servers: dict[str, ray.actor.ActorHandle],
-    max_cache_size: int = DEFAULT_ROUTING_CACHE_SIZE,
-    enable_fault_tolerance: bool = False,
-):
-    """Initialize the LB around the recipe-owned ``_LoadBalancerCore``."""
-    # Diagnostic probe for the "LB actor is bare" issue — remove once resolved.
-    # Runs inside the LB actor process at actor construction. If this line never
-    # appears in the logs, the actor class snapshot was the bare native one.
-    try:
-        _lcl = getattr(ray._private.worker.global_worker, "load_code_from_local", None)
-    except Exception:
-        _lcl = "<no-ray-worker>"
-    logger.warning(
-        "rollout_elastic probe[lb_init]: pid=%s host=%s VERL_USE_EXTERNAL_MODULES=%r load_code_from_local=%s",
-        os.getpid(),
-        socket.gethostname(),
-        os.getenv("VERL_USE_EXTERNAL_MODULES"),
-        _lcl,
-    )
-    from verl.workers.rollout.fault_tolerance.load_balancer import _LoadBalancerCore
-
-    orig(self, servers, max_cache_size=max_cache_size)
-    self._core = _LoadBalancerCore(
-        servers=servers,
-        max_cache_size=max_cache_size,
-        enable_fault_tolerance=enable_fault_tolerance,
-    )
-    setattr(self, _ORIG_LB, self._core)
-
-
-def _lb_core(self):
-    core = getattr(self, _ORIG_LB, None)
-    if core is None:
-        # Safety net for actors constructed before the patch was installed.
+    def __init__(
+        self,
+        servers: dict[str, ray.actor.ActorHandle],
+        max_cache_size: int = DEFAULT_ROUTING_CACHE_SIZE,
+        enable_fault_tolerance: bool = False,
+    ) -> None:
         from verl.workers.rollout.fault_tolerance.load_balancer import _LoadBalancerCore
 
-        core = _LoadBalancerCore(servers=self._server)
-        setattr(self, _ORIG_LB, core)
-    return core
+        self._core = _LoadBalancerCore(
+            servers=servers,
+            max_cache_size=max_cache_size,
+            enable_fault_tolerance=enable_fault_tolerance,
+        )
+        logger.warning(
+            "[FT] Elastic LB initialized: pid=%s host=%s servers=%s ft=%s",
+            os.getpid(),
+            socket.gethostname(),
+            list(servers),
+            enable_fault_tolerance,
+        )
 
+    def acquire_server(self, request_id: str) -> str:
+        return self._core.acquire_server(request_id)
 
-@patch(GlobalRequestLoadBalancer, "acquire_server")
-def acquire_server(self, request_id: str) -> str:
-    """Acquire a server for the given request, skipping dead servers."""
-    return _lb_core(self).acquire_server(request_id)
+    def release_server(self, server_id: str) -> None:
+        self._core.release_server(server_id)
 
+    def mark_failed(self, server_id: str) -> None:
+        self._core.mark_failed(server_id)
+        logger.warning("[FT] Elastic LB mark_failed completed: server_id=%s", server_id)
 
-@patch(GlobalRequestLoadBalancer, "release_server")
-def release_server(self, server_id: str) -> None:
-    """Release a server after a request completes, decrementing its inflight count."""
-    _lb_core(self).release_server(server_id)
+    def set_fault_tolerance(self, enabled: bool) -> None:
+        self._core._ft = bool(enabled)
 
+    def add_servers(self, servers: dict[str, ray.actor.ActorHandle]) -> None:
+        self._core.add_servers(servers)
 
-@add(GlobalRequestLoadBalancer, "mark_failed")
-def mark_failed(self, server_id: str) -> None:
-    """Mark a server as dead; subsequent acquires skip it. Idempotent."""
-    _lb_core(self).mark_failed(server_id)
+    def remove_servers(self, server_ids: list[str]) -> None:
+        self._core.remove_servers(server_ids)
 
-
-@add(GlobalRequestLoadBalancer, "set_fault_tolerance")
-def set_fault_tolerance(self, enabled: bool) -> None:
-    """Enable or disable fault tolerance for the load balancer."""
-    _lb_core(self)._ft = bool(enabled)
-
-
-@patch(GlobalRequestLoadBalancer, "add_servers")
-def add_servers(self, servers: dict[str, ray.actor.ActorHandle]) -> None:
-    """Add new servers to the server handles. Idempotent; resurrects dead ids."""
-    _lb_core(self).add_servers(servers)
-
-
-@patch(GlobalRequestLoadBalancer, "remove_servers")
-def remove_servers(self, server_ids: list[str]) -> None:
-    """Remove servers from the server handles."""
-    _lb_core(self).remove_servers(server_ids)
-
-
-@add(GlobalRequestLoadBalancer, "get_server_handle")
-def get_server_handle(self, server_id: str):
-    """Return the Ray actor handle for ``server_id``, or None if unknown."""
-    return _lb_core(self).get_server_handle(server_id)
+    def get_server_handle(self, server_id: str):
+        return self._core.get_server_handle(server_id)
 
 
 # ---------------------------------------------------------------------------
@@ -314,11 +272,11 @@ def _release_server(self, server_id: str) -> None:
 
 @add(LLMServerClient, "_mark_server_failed")
 async def _mark_server_failed(self, server_id: str) -> None:
-    """Fire-and-forget notify LB that a server is dead. Must never block."""
+    """Notify LB with a bounded wait; log failures without propagating them."""
     try:
         await asyncio.wait_for(self._load_balancer.mark_failed.remote(server_id=server_id), timeout=3.0)
     except Exception:
-        logger.warning("[FT] _mark_server_failed: mark server %s failed", server_id)
+        logger.exception("[FT] LB mark_failed RPC failed: server_id=%s", server_id)
 
 
 @patch(LLMServerClient, "generate")
@@ -675,12 +633,13 @@ async def _init_global_load_balancer(self) -> None:
         ft_on = bool(self.config.async_training.fault_tolerance.enabled)
     except (AttributeError, KeyError):
         pass
-    self.global_load_balancer = GlobalRequestLoadBalancer.remote(
+    self.global_load_balancer = ElasticGlobalRequestLoadBalancer.remote(
         servers=dict(zip(self.server_addresses, self.server_handles, strict=True)),
         max_cache_size=DEFAULT_ROUTING_CACHE_SIZE,
+        enable_fault_tolerance=ft_on,
     )
-    if ft_on:
-        await self.global_load_balancer.set_fault_tolerance.remote(True)
+    # Surface actor initialization failures before returning the manager.
+    await self.global_load_balancer.set_fault_tolerance.remote(ft_on)
 
 
 @patch(LLMServerManager, "get_client")
