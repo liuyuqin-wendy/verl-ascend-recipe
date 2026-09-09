@@ -248,6 +248,9 @@ async def _generate_once(
 
 @patch(LLMServerClient, "_acquire_server")
 async def _acquire_server(self, request_id: str) -> tuple[str, ray.actor.ActorHandle]:
+    if not self._ft_enabled():
+        return await self._orig__acquire_server(request_id)
+
     server_id = await self._load_balancer.acquire_server.remote(request_id=request_id)
     handle = self._server_id_to_handle.get(server_id)
     if handle is None:
@@ -261,6 +264,9 @@ async def _acquire_server(self, request_id: str) -> tuple[str, ray.actor.ActorHa
 
 @patch(LLMServerClient, "_release_server")
 def _release_server(self, server_id: str) -> None:
+    if not self._ft_enabled():
+        return self._orig__release_server(server_id)
+
     # Fire-and-forget: release is just a counter decrement, no need to await.
     # Awaiting here risks blocking the finally clause if the LB actor is unresponsive.
     try:
@@ -273,6 +279,9 @@ def _release_server(self, server_id: str) -> None:
 @add(LLMServerClient, "_mark_server_failed")
 async def _mark_server_failed(self, server_id: str) -> None:
     """Notify LB with a bounded wait; log failures without propagating them."""
+    if not self._ft_enabled():
+        return
+
     try:
         await asyncio.wait_for(self._load_balancer.mark_failed.remote(server_id=server_id), timeout=3.0)
     except Exception:
@@ -626,20 +635,28 @@ async def _init_progress_store(self, progress_cfg) -> None:
     await self._progress_store.init.remote(progress_cfg)
 
 
+@add(LLMServerManager, "_ft_enabled")
+def _manager_ft_enabled(self) -> bool:
+    """Select the LB and client implementation from the same master switch."""
+    try:
+        return bool(self.config.async_training.fault_tolerance.enabled)
+    except (AttributeError, KeyError):
+        return False
+
+
 @patch(LLMServerManager, "_init_global_load_balancer")
 async def _init_global_load_balancer(self) -> None:
-    ft_on = False
-    try:
-        ft_on = bool(self.config.async_training.fault_tolerance.enabled)
-    except (AttributeError, KeyError):
-        pass
+    if not self._ft_enabled():
+        await self._orig__init_global_load_balancer()
+        return
+
     self.global_load_balancer = ElasticGlobalRequestLoadBalancer.remote(
         servers=dict(zip(self.server_addresses, self.server_handles, strict=True)),
         max_cache_size=DEFAULT_ROUTING_CACHE_SIZE,
-        enable_fault_tolerance=ft_on,
+        enable_fault_tolerance=True,
     )
     # Surface actor initialization failures before returning the manager.
-    await self.global_load_balancer.set_fault_tolerance.remote(ft_on)
+    await self.global_load_balancer.set_fault_tolerance.remote(True)
 
 
 @patch(LLMServerManager, "get_client")
@@ -648,8 +665,11 @@ def get_client(self, fully_async: bool = False, retry: bool = False) -> LLMServe
 
     Args:
         fully_async (bool): Whether to return the FullyLLMServerClient.
-        retry (bool): Whether to retry on server unavailability.
+        retry (bool): Whether to retry on server unavailability when FT is enabled.
     """
+    if not self._ft_enabled():
+        return self._orig_get_client(fully_async=fully_async)
+
     servers = dict(zip(self.server_addresses, self.server_handles, strict=True))
     common = dict(
         config=self.config,
