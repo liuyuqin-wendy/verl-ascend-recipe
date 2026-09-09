@@ -105,6 +105,10 @@ class _LoadBalancerCore:
             self._dead.add(server_id)
         # If server_id is unknown entirely, silently no-op (idempotent on unknown ids).
 
+    def set_fault_tolerance(self, enabled: bool) -> None:
+        """Toggle fault-tolerant semantics (lenient release, dead-set routing)."""
+        self._ft = bool(enabled)
+
     def add_servers(self, servers: dict) -> None:
         """Register new servers. Idempotent on existing ids. Resurrect dead ids."""
         for sid, handle in servers.items():

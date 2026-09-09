@@ -61,6 +61,15 @@ from ._core import add, patch, wrap
 
 logger = logging.getLogger(__name__)
 
+
+def _read_ft_enabled(config: Any) -> bool:
+    """Read the FT master switch; missing config keys mean disabled."""
+    try:
+        return bool(config.async_training.fault_tolerance.enabled)
+    except (AttributeError, KeyError):
+        return False
+
+
 # ---------------------------------------------------------------------------
 # Recipe-owned LB actor — all methods are defined before Ray wraps the class
 # ---------------------------------------------------------------------------
@@ -102,7 +111,7 @@ class ElasticGlobalRequestLoadBalancer:
         logger.warning("[FT] Elastic LB mark_failed completed: server_id=%s", server_id)
 
     def set_fault_tolerance(self, enabled: bool) -> None:
-        self._core._ft = bool(enabled)
+        self._core.set_fault_tolerance(enabled)
 
     def add_servers(self, servers: dict[str, ray.actor.ActorHandle]) -> None:
         self._core.add_servers(servers)
@@ -140,10 +149,7 @@ def _client_init(
 @add(LLMServerClient, "_ft_enabled")
 def _ft_enabled(self) -> bool:
     """Whether the fault-tolerance master switch is on for this config."""
-    try:
-        return bool(self.config.async_training.fault_tolerance.enabled)
-    except (AttributeError, KeyError):
-        return False
+    return _read_ft_enabled(self.config)
 
 
 @add(LLMServerClient, "_ft_call_timeout_s")
@@ -638,10 +644,7 @@ async def _init_progress_store(self, progress_cfg) -> None:
 @add(LLMServerManager, "_ft_enabled")
 def _manager_ft_enabled(self) -> bool:
     """Select the LB and client implementation from the same master switch."""
-    try:
-        return bool(self.config.async_training.fault_tolerance.enabled)
-    except (AttributeError, KeyError):
-        return False
+    return _read_ft_enabled(self.config)
 
 
 @patch(LLMServerManager, "_init_global_load_balancer")
@@ -650,7 +653,17 @@ async def _init_global_load_balancer(self) -> None:
         await self._orig__init_global_load_balancer()
         return
 
-    self.global_load_balancer = ElasticGlobalRequestLoadBalancer.remote(
+    try:
+        from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
+
+        node_id = ray.get_runtime_context().get_node_id()
+        scheduling_strategy = NodeAffinitySchedulingStrategy(node_id=node_id, soft=True)
+    except Exception:
+        scheduling_strategy = None
+    options: dict[str, Any] = {"max_restarts": 3, "max_task_retries": 3}
+    if scheduling_strategy is not None:
+        options["scheduling_strategy"] = scheduling_strategy
+    self.global_load_balancer = ElasticGlobalRequestLoadBalancer.options(**options).remote(
         servers=dict(zip(self.server_addresses, self.server_handles, strict=True)),
         max_cache_size=DEFAULT_ROUTING_CACHE_SIZE,
         enable_fault_tolerance=True,
