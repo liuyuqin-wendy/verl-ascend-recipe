@@ -37,6 +37,7 @@ through decorators.
 from __future__ import annotations
 
 import asyncio
+import functools
 import logging
 import os
 import socket
@@ -60,6 +61,23 @@ from verl.workers.rollout.replica import RolloutReplica, TokenOutput
 from ._core import add, patch, wrap
 
 logger = logging.getLogger(__name__)
+
+
+def _native_when_ft_disabled(cls):
+    """Dispatch before recipe tracing; capture this class's own native method."""
+    native = cls.generate
+
+    def decorate(ft_generate):
+        @functools.wraps(ft_generate)
+        async def generate(self, *args, **kwargs):
+            if not self._ft_enabled():
+                return await native(self, *args, **kwargs)
+            return await ft_generate(self, *args, **kwargs)
+
+        return generate
+
+    return decorate
+
 
 # ---------------------------------------------------------------------------
 # Recipe-owned LB actor — all methods are defined before Ray wraps the class
@@ -289,6 +307,7 @@ async def _mark_server_failed(self, server_id: str) -> None:
 
 
 @patch(LLMServerClient, "generate")
+@_native_when_ft_disabled(LLMServerClient)
 @rollout_trace_op
 async def generate(
     self,
@@ -389,6 +408,7 @@ def _model_version_policy(self):
 
 
 @patch(FullyLLMServerClient, "generate")
+@_native_when_ft_disabled(FullyLLMServerClient)
 @rollout_trace_op
 async def _fully_generate(
     self,

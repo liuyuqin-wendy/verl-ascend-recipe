@@ -50,6 +50,11 @@ from verl.experimental.agent_loop.agent_loop import (
     AgentLoopWorker,
     get_trajectory_info,
 )
+from verl.experimental.fully_async_policy import (
+    fully_async_main,
+    fully_async_rollouter,
+    fully_async_trainer,
+)
 from verl.experimental.fully_async_policy.detach_utils import safe_create_task
 from verl.experimental.fully_async_policy.fully_async_main import FullyAsyncTaskRunner
 from verl.experimental.fully_async_policy.fully_async_rollouter import (
@@ -67,7 +72,7 @@ from verl.utils.tracking import Tracking
 from verl.workers.rollout.fault_tolerance import filter_partial_batch
 from verl.workers.rollout.llm_server import LLMServerManager
 
-from ._core import add, patch, wrap
+from ._core import add, patch, unwrap_ray_remote, wrap
 
 logger = logging.getLogger(__name__)
 
@@ -642,6 +647,8 @@ async def _one_step_fit_step(self, batch_data_future, continuous_iterator):
 @wrap(FullyAsyncRollouter, "__init__")
 def _rollouter_init(orig, self, *args, **kwargs):
     orig(self, *args, **kwargs)
+    if not OmegaConf.select(self.config, "async_training.fault_tolerance.enabled", default=False):
+        return
     # Fault tolerance is constructed before the trainer's first sync and
     # started by init_ft_supervisor so CKE-first failures are reportable.
     self._ft_supervisor = None
@@ -807,6 +814,9 @@ async def _rollouter_promote_synced_replica(
 
 @patch(FullyAsyncRollouter, "_init_async_rollout_manager")
 async def _rollouter_init_async_rollout_manager(self):
+    if not OmegaConf.select(self.config, "async_training.fault_tolerance.enabled", default=False):
+        return await self._orig__init_async_rollout_manager()
+
     # infrastructure overview: https://verl.readthedocs.io/en/latest/advance/reward_loop.html#architecture-design
     # agent_reward_loop: streaming reward computation with actor rollout
     # two conditions satisfied: (1) no reward model, or (2) reward model with extra resource pool
@@ -888,6 +898,8 @@ def _rollouter_build_progress_config(self, progress_node):
 @patch(FullyAsyncRollouter, "fit")
 async def _rollouter_fit(self):
     """Start the async rollouter — FT-aware Supervisor lifecycle."""
+    if not OmegaConf.select(self.config, "async_training.fault_tolerance.enabled", default=False):
+        return await self._orig_fit()
 
     print("[FullyAsyncRollouter] Starting FullyAsyncRollouter...")
 
@@ -946,6 +958,9 @@ async def _rollouter_fit(self):
 @patch(FullyAsyncTrainer, "_setup_checkpoint_manager")
 def _async_trainer_setup_checkpoint_manager(self, rollouter):
     """Setup checkpoint manager after rollouter is initialized (FT-aware)."""
+    if not OmegaConf.select(self.config, "async_training.fault_tolerance.enabled", default=False):
+        return self._orig__setup_checkpoint_manager(rollouter)
+
     replicas = ray.get(rollouter.get_replicas.remote())
     checkpoint_engine_config = omega_conf_to_dataclass(self.config.actor_rollout_ref.rollout.checkpoint_engine)
 
@@ -1015,13 +1030,15 @@ async def _async_trainer_on_replica_added_from_supervisor(self, new_replica):
 @patch(FullyAsyncTaskRunner, "_initialize_components")
 def _async_main_initialize_components(self, config) -> None:
     """Initialize all components for the fully-async training run (FT-aware)."""
+    if not OmegaConf.select(config, "async_training.fault_tolerance.enabled", default=False):
+        return self._orig__initialize_components(config)
+
     import os
     import socket
     from concurrent.futures import ThreadPoolExecutor
     from pprint import pprint
 
     import ray
-    from omegaconf import OmegaConf
 
     from verl.experimental.fully_async_policy.message_queue import MessageQueue, MessageQueueClient
     from verl.experimental.separation.utils import create_role_worker_mapping
@@ -1095,3 +1112,16 @@ def _async_main_initialize_components(self, config) -> None:
         ray.get(self.components["trainer"]._fit_validate.remote(True))
 
     print("[ASYNC MAIN] All components initialized successfully")
+
+
+# Refresh Ray's wrappers and method tables only after all decorators complete.
+# Reuse the original Python classes to preserve identity, inheritance and super().
+FullyAsyncRollouter = ray.remote(num_cpus=10, max_concurrency=100)(unwrap_ray_remote(FullyAsyncRollouter))
+FullyAsyncTrainer = ray.remote(num_cpus=10)(unwrap_ray_remote(FullyAsyncTrainer))
+fully_async_rollouter.FullyAsyncRollouter = FullyAsyncRollouter
+fully_async_trainer.FullyAsyncTrainer = FullyAsyncTrainer
+fully_async_main.FullyAsyncRollouter = FullyAsyncRollouter
+fully_async_main.FullyAsyncTrainer = FullyAsyncTrainer
+
+FullyAsyncTaskRunner = ray.remote(num_cpus=1)(unwrap_ray_remote(FullyAsyncTaskRunner))
+fully_async_main.FullyAsyncTaskRunner = FullyAsyncTaskRunner
