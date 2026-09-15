@@ -690,7 +690,12 @@ async def _rollouter_init_ft_supervisor(self, trainer_handle):
         ft_node = OmegaConf.select(self.config, "async_training.fault_tolerance")
         if ft_node is not None:
             ft_cfg = FaultToleranceConfig(**OmegaConf.to_container(ft_node, resolve=True))
-    except Exception:
+    except Exception as _e:
+        _ft_log.warning(
+            "[FT] init_ft_supervisor: failed to build FaultToleranceConfig: %r — treating as disabled",
+            _e,
+            exc_info=True,
+        )
         ft_cfg = None
 
     self._ft_supervisor = None
