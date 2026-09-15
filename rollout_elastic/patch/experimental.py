@@ -1147,7 +1147,9 @@ def _ft_training_node_ids() -> list[str]:
         name = entry.get("name") or ""
         if not name.startswith(("trainer_poolverl_group_", "teacher_poolverl_group_")):
             continue
-        for node_id in (entry.get("bundles_to_node_ids") or {}).values():
+        # Ray <2.5 exposed "bundles_to_node_ids"; newer Ray uses "bundles_to_node_id".
+        bundles = entry.get("bundles_to_node_id") or entry.get("bundles_to_node_ids") or {}
+        for node_id in bundles.values():
             if node_id and node_id not in node_ids:
                 node_ids.append(node_id)
     node_ids.sort()
@@ -1160,9 +1162,14 @@ def _ft_training_node_ids_or_warn(config, label: str) -> list[str]:
         return []
     node_ids = _ft_training_node_ids()
     if not node_ids:
+        try:
+            known = sorted({entry.get("name") or "?" for entry in ray.util.placement_group_table().values()})
+        except Exception:
+            known = []
         logger.warning(
             "[placement] fault tolerance is enabled but no trainer_pool placement groups "
-            "found yet; %s will fall back to native scheduling and may land on inference nodes",
+            "found yet (known PGs: %s); %s will fall back to native scheduling and may land on inference nodes",
+            known or "none",
             label,
         )
     return node_ids
