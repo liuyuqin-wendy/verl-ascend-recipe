@@ -63,6 +63,7 @@ from verl.experimental.fully_async_policy.fully_async_rollouter import (
 )
 from verl.experimental.fully_async_policy.fully_async_trainer import FullyAsyncTrainer
 from verl.experimental.one_step_off_policy.ray_trainer import OneStepOffRayTrainer
+from verl.experimental.reward_loop.reward_loop import RewardLoopManager
 from verl.experimental.separation.ray_trainer import SeparateRayPPOTrainer
 from verl.protocol import DataProto
 from verl.utils.config import omega_conf_to_dataclass
@@ -1086,7 +1087,7 @@ def _async_main_initialize_components(self, config) -> None:
     # max_queue_size
     max_queue_size = ray.get(self.components["rollouter"].get_max_queue_size.remote())
     print(f"[ASYNC MAIN] Creating MessageQueue... max_queue_size {max_queue_size}")
-    message_queue = MessageQueue.remote(config, max_queue_size)
+    message_queue = _FtNodeAffinityRemote(MessageQueue, "message_queue").remote(config, max_queue_size)
     message_queue_client = MessageQueueClient(message_queue)
     self.components["message_queue"] = message_queue
     self.components["message_queue_client"] = message_queue_client
@@ -1114,6 +1115,141 @@ def _async_main_initialize_components(self, config) -> None:
     print("[ASYNC MAIN] All components initialized successfully")
 
 
+# ---------------------------------------------------------------------------
+# placement — keep CPU-side actors off the inference-only nodes
+# ---------------------------------------------------------------------------
+# Inference replicas (vLLM/NPU pods) are rescheduled by Kubernetes on fault;
+# any CPU actor colocated with them dies with the pod and breaks the
+# fully-async generation pipeline. Every CPU-side actor therefore gets a soft
+# node affinity to the nodes hosting the ``trainer_pool`` placement groups
+# (deterministic verl naming: ``<pool_name>verl_group_<...>:`` from
+# ``RayResourcePool.get_placement_groups``). Soft affinity keeps the native
+# fallback semantics when a training node runs out of CPUs.
+
+
+def _ft_placement_enabled(config) -> bool:
+    """Placement is opt-out: on whenever fault tolerance is enabled."""
+    if config is None:
+        return False
+    if not OmegaConf.select(config, "async_training.fault_tolerance.enabled", default=False):
+        return False
+    return OmegaConf.select(config, "async_training.fault_tolerance.placement.enabled", default=True)
+
+
+def _ft_training_node_ids() -> list[str]:
+    """Node ids hosting the ``trainer_pool`` / ``teacher_pool`` placement groups."""
+    node_ids: list[str] = []
+    try:
+        table = ray.util.placement_group_table()
+    except Exception:  # pragma: no cover - defensive: no cluster metadata yet
+        return node_ids
+    for entry in table.values():
+        name = entry.get("name") or ""
+        if not name.startswith(("trainer_poolverl_group_", "teacher_poolverl_group_")):
+            continue
+        for node_id in (entry.get("bundles_to_node_ids") or {}).values():
+            if node_id and node_id not in node_ids:
+                node_ids.append(node_id)
+    node_ids.sort()
+    return node_ids
+
+
+def _ft_training_node_ids_or_warn(config, label: str) -> list[str]:
+    """Training-node ids when placement applies; warn instead of failing silently."""
+    if not _ft_placement_enabled(config):
+        return []
+    node_ids = _ft_training_node_ids()
+    if not node_ids:
+        logger.warning(
+            "[placement] fault tolerance is enabled but no trainer_pool placement groups "
+            "found yet; %s will fall back to native scheduling and may land on inference nodes",
+            label,
+        )
+    return node_ids
+
+
+class _FtNodeAffinityRemote:
+    """Proxy exposing ``.remote()`` that pins the actor to a training node.
+
+    Falls through to native scheduling when placement is disabled or no
+    ``trainer_pool`` placement group exists yet (e.g. the trainer actor
+    itself, which is created before its own resource pools — documented
+    limitation: that coordinator may still land on an inference node unless
+    the deployment pre-creates the trainer pools).
+    """
+
+    def __init__(self, actor_cls, label: str):
+        self._actor_cls = actor_cls
+        self._label = label
+        self._index = 0
+
+    def remote(self, *args, **kwargs):
+        config = kwargs.get("config")
+        if config is None and args:
+            config = args[0]
+        node_ids = _ft_training_node_ids_or_warn(config, f"the {self._label} actor")
+        if not node_ids:
+            return self._actor_cls.remote(*args, **kwargs)
+        node_id = node_ids[self._index % len(node_ids)]
+        self._index += 1
+        logger.info("[placement] pin %s to training node %s (soft)", self._label, node_id)
+        return self._actor_cls.options(
+            scheduling_strategy=ray.util.scheduling_strategies.NodeAffinitySchedulingStrategy(
+                node_id=node_id, soft=True
+            )
+        ).remote(*args, **kwargs)
+
+
+@wrap(AgentLoopManager, "_init_agent_loop_workers")
+async def _agent_manager_init_workers(orig, self, *args, **kwargs):
+    """Round-robin agent loop workers over training nodes only."""
+    node_ids = _ft_training_node_ids_or_warn(self.config, "agent loop workers")
+    if not node_ids:
+        return await orig(self, *args, **kwargs)
+
+    self.agent_loop_workers = []
+    num_workers = self.rollout_config.agent.num_workers
+    for i in range(num_workers):
+        node_id = node_ids[i % len(node_ids)]
+        self.agent_loop_workers.append(
+            self.agent_loop_workers_class.options(
+                name=f"agent_loop_worker_{i}" + f"_{uuid.uuid4().hex[:8]}",
+                scheduling_strategy=ray.util.scheduling_strategies.NodeAffinitySchedulingStrategy(
+                    node_id=node_id, soft=True
+                ),
+            ).remote(
+                self.config,
+                self.llm_client,
+                self.teacher_client,
+                self.reward_loop_worker_handles,
+            )
+        )
+    logger.info("[placement] placed %d agent loop workers on training nodes %s", num_workers, node_ids)
+
+
+@wrap(RewardLoopManager, "_init_reward_loop_workers")
+def _reward_manager_init_workers(orig, self, *args, **kwargs):
+    """Round-robin reward loop workers over training nodes only."""
+    node_ids = _ft_training_node_ids_or_warn(self.config, "reward loop workers")
+    if not node_ids:
+        return orig(self, *args, **kwargs)
+
+    self.reward_loop_workers = []
+    num_workers = self.config.reward.num_workers
+    for i in range(num_workers):
+        node_id = node_ids[i % len(node_ids)]
+        self.reward_loop_workers.append(
+            self.reward_loop_workers_class.options(
+                name=f"reward_loop_worker_{i}",
+                scheduling_strategy=ray.util.scheduling_strategies.NodeAffinitySchedulingStrategy(
+                    node_id=node_id,
+                    soft=True,
+                ),
+            ).remote(self.config, self.reward_router_address)
+        )
+    logger.info("[placement] placed %d reward loop workers on training nodes %s", num_workers, node_ids)
+
+
 # Refresh Ray's wrappers and method tables only after all decorators complete.
 # Reuse the original Python classes to preserve identity, inheritance and super().
 FullyAsyncRollouter = ray.remote(num_cpus=10, max_concurrency=100)(unwrap_ray_remote(FullyAsyncRollouter))
@@ -1125,3 +1261,10 @@ fully_async_main.FullyAsyncTrainer = FullyAsyncTrainer
 
 FullyAsyncTaskRunner = ray.remote(num_cpus=1)(unwrap_ray_remote(FullyAsyncTaskRunner))
 fully_async_main.FullyAsyncTaskRunner = FullyAsyncTaskRunner
+
+# Placement: pin the top-level CPU coordinators to training nodes. The trainer
+# actor is created before its own resource pools exist, so its candidate set is
+# empty at that point and the wrapper falls through to native scheduling
+# (documented limitation, see _FtNodeAffinityRemote).
+fully_async_main.FullyAsyncRollouter = _FtNodeAffinityRemote(FullyAsyncRollouter, "fully_async_rollouter")
+fully_async_main.FullyAsyncTrainer = _FtNodeAffinityRemote(FullyAsyncTrainer, "fully_async_trainer")
