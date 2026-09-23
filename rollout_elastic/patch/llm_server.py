@@ -753,6 +753,21 @@ def _manager_ft_enabled(self) -> bool:
     return _read_ft_enabled(self.config)
 
 
+@add(LLMServerManager, "_ft_replacement_give_up_timeout_s")
+def _manager_ft_replacement_give_up_timeout_s(self) -> float:
+    """Give-up timeout for replacement: training stays with N-1 replicas."""
+    try:
+        return float(
+            OmegaConf.select(
+                self.config,
+                "async_training.fault_tolerance.replacement_give_up_timeout_s",
+                default=180.0,
+            )
+        )
+    except (AttributeError, KeyError, TypeError):
+        return 180.0
+
+
 @patch(LLMServerManager, "_init_global_load_balancer")
 async def _init_global_load_balancer(self) -> None:
     if not self._ft_enabled():
@@ -817,17 +832,15 @@ async def spawn_replacement(self, dead_id: str) -> RolloutReplica:
     if self.worker_group is not None:
         raise RuntimeError("spawn_replacement is standalone-mode only")
 
-    if dead_id not in self.server_addresses:
+    dead_replica = next((r for r in self.rollout_replicas if r._server_address == dead_id), None)
+    if dead_replica is None:
         raise ValueError(f"unknown dead_id={dead_id!r}; have {self.server_addresses}")
-    dead_rank = self.server_addresses.index(dead_id)
+    # List position != replica_rank after any replacement, so read both from the object.
+    dead_rank = dead_replica.replica_rank
+    dead_suffix = dead_replica.name_suffix
     log.warning("[FT] spawn_replacement: dead_id=%s rank=%s — beginning respawn", dead_id, dead_rank)
 
-    self.rollout_replicas = [r for r in self.rollout_replicas if r._server_address != dead_id]
-    kept = {r._server_address for r in self.rollout_replicas}
-    self.server_addresses = [a for a in self.server_addresses if a in kept]
-    self.server_handles = [r._server_handle for r in self.rollout_replicas]
-
-    await self._reclaim_ray_resources(dead_rank, log)
+    await self._reclaim_ray_resources(dead_rank, dead_suffix, log)
 
     # A killed named Ray actor can remain in Ray's name registry briefly.
     # Do not reuse the dead replica's fixed name prefix: on multi-node replicas
@@ -845,9 +858,11 @@ async def spawn_replacement(self, dead_id: str) -> RolloutReplica:
     if not bool(await asyncio.wait_for(new_replica.health(), timeout=30.0)):
         raise RuntimeError(f"new replica for {dead_id} (rank={dead_rank}) failed health check")
 
-    self.rollout_replicas.append(new_replica)
-    self.server_addresses.append(new_replica._server_address)
-    self.server_handles.append(new_replica._server_handle)
+    # Swap in place only on success: failures leave the lists untouched so the same dead_id can be retried.
+    idx = self.rollout_replicas.index(dead_replica)
+    self.rollout_replicas[idx] = new_replica
+    self.server_addresses[idx] = new_replica._server_address
+    self.server_handles[idx] = new_replica._server_handle
     log.warning(
         "[FT] spawn_replacement: new replica %s (rank=%s) up and healthy",
         new_replica._server_address,
@@ -857,7 +872,7 @@ async def spawn_replacement(self, dead_id: str) -> RolloutReplica:
 
 
 @add(LLMServerManager, "_reclaim_ray_resources")
-async def _reclaim_ray_resources(self, dead_rank: int, log: logging.Logger) -> None:
+async def _reclaim_ray_resources(self, dead_rank: int, name_suffix: str, log: logging.Logger) -> None:
     """Kill stale actors, remove their placement groups, then await a full replica's resources."""
     from ray.util.placement_group import get_placement_group, placement_group_table, remove_placement_group
 
@@ -865,15 +880,18 @@ async def _reclaim_ray_resources(self, dead_rank: int, log: logging.Logger) -> N
 
     nnodes = int(self.rollout_config.nnodes)
     local_world_size = int(self.rollout_config.n_gpus_per_node)
+    worker_prefix = f"rollout_standalone_{dead_rank}{name_suffix}"
     candidate_names = (
         [
-            f"rollout_standalone_{dead_rank}{cls}{pg_idx}:{local_rank}"
+            f"{worker_prefix}{cls}{pg_idx}:{local_rank}"
             for cls in ("CheckpointEngineWorker", "vLLMHttpServer")
             for pg_idx in range(nnodes)
             for local_rank in range(local_world_size)
         ]
+        # vLLM HTTP server actor names differ across verl versions (with or without suffix).
         + [f"vllm_server_{dead_rank}_{i}" for i in range(nnodes)]
-        + [f"rollout_standalone_{dead_rank}"]
+        + [f"vllm_server_{dead_rank}_{i}{name_suffix}" for i in range(nnodes)]
+        + [worker_prefix]
     )
     for name in candidate_names:
         try:
@@ -883,7 +901,7 @@ async def _reclaim_ray_resources(self, dead_rank: int, log: logging.Logger) -> N
         ray.kill(handle, no_restart=True)
         log.warning("[FT] spawn_replacement: ray.kill stale actor %s", name)
 
-    pg_prefix = f"rollout_pool_{dead_rank}"
+    pg_prefix = f"rollout_pool_{dead_rank}{name_suffix}"
     for pg_id, info in placement_group_table().items():
         name = info.get("name", "")
         if not name.startswith(pg_prefix):
@@ -902,8 +920,9 @@ async def _reclaim_ray_resources(self, dead_rank: int, log: logging.Logger) -> N
         * self.rollout_config.pipeline_model_parallel_size
     ) // nnodes
     required_accelerators = rollout_world_size
+    timeout_s = self._ft_replacement_give_up_timeout_s()
     loop = asyncio.get_running_loop()
-    deadline = loop.time() + 180.0
+    deadline = loop.time() + timeout_s
     last_seen = -1.0
     while True:
         accelerator_avail = float(ray.available_resources().get(resource_name, 0.0))
@@ -917,7 +936,7 @@ async def _reclaim_ray_resources(self, dead_rank: int, log: logging.Logger) -> N
             return
         if loop.time() > deadline:
             raise RuntimeError(
-                "dead replica resources not freed after 180s "
+                f"dead replica resources not freed after {timeout_s}s "
                 f"(available {resource_name}={accelerator_avail}, required={required_accelerators})"
             )
         if abs(accelerator_avail - last_seen) > 0.01:

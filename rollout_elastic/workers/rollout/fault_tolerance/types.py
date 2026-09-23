@@ -70,6 +70,9 @@ class FaultToleranceConfig:
     replace_dead_replicas: bool = True
     """If True (standalone mode only), supervisor spawns replacement on dead."""
 
+    replacement_give_up_timeout_s: float = 180.0
+    """Give-up timeout for replacement: training stays with N-1 replicas."""
+
     # ----- Token continuation sub-config -----
     progress: ProgressConfig = field(default_factory=lambda: _default_progress_config())
     """Token 续推子配置. 当 ``progress.enabled=True`` 且 ``enabled=True`` 时启用."""

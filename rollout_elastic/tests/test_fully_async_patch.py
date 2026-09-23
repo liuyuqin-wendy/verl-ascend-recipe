@@ -7,7 +7,9 @@ tests cover patch installation and RPC dispatch, not training or recovery.
 from __future__ import annotations
 
 import ast
+import asyncio
 import importlib.util
+import logging
 import os
 import runpy
 import subprocess
@@ -57,6 +59,9 @@ def _build_patched_actors(ray):
         def _setup_checkpoint_manager(self, rollouter):
             return "native-checkpoint", rollouter
 
+        async def _get_samples_from_queue(self):
+            return "native-samples"
+
     class NativeTaskRunner:
         def _initialize_components(self, config):
             return "native-main"
@@ -82,6 +87,8 @@ def _build_patched_actors(ray):
         patch=core.patch,
         wrap=core.wrap,
         unwrap_ray_remote=core.unwrap_ray_remote,
+        logging=logging,
+        logger=logging.getLogger("fully_async_patch_test"),
     )
     tree = ast.parse((PATCH_DIR / "experimental.py").read_text(encoding="utf-8"))
     nodes = []
@@ -93,8 +100,11 @@ def _build_patched_actors(ray):
             finalizing = True
         if finalizing:
             nodes.append(node)
+        elif isinstance(node, ast.ClassDef) and node.name == "_FtNodeAffinityRemote":
+            nodes.append(node)
         elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and (
-            node.name == "_sep_trainer_init" or node.name.startswith(("_rollouter_", "_async_trainer_", "_async_main_"))
+            node.name == "_sep_trainer_init"
+            or node.name.startswith(("_rollouter_", "_async_trainer_", "_async_main_", "_ft_"))
         ):
             nodes.append(node)
     future = ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0)
@@ -140,6 +150,7 @@ class FullyAsyncRayPatchTests(unittest.TestCase):
                 "promote_synced_replica",
             ),
             "FullyAsyncTrainer": (
+                "_get_samples_from_queue",
                 "_on_replica_dead_from_supervisor",
                 "_on_replica_added_from_supervisor",
             ),
@@ -150,7 +161,9 @@ class FullyAsyncRayPatchTests(unittest.TestCase):
                 actor = self.patched[name]
                 original = self.original[name]
                 self.assertIsNot(actor, original)
-                self.assertIs(getattr(self.patched["fully_async_main"], name), actor)
+                # fully_async_main may hold a placement proxy; unwrap it.
+                rebound = getattr(self.patched["fully_async_main"], name)
+                self.assertIs(getattr(rebound, "_actor_cls", rebound), actor)
                 self.assertEqual(actor._default_options, actor_options)
                 self.assertIs(actor.__ray_actor_class__, original.__ray_actor_class__)
                 self.assertIsNot(
@@ -222,6 +235,10 @@ class FullyAsyncRayPatchTests(unittest.TestCase):
                             ("native-checkpoint", "rollouter"),
                         )
                         self.assertEqual(
+                            self.ray.get(trainer._get_samples_from_queue.remote(), timeout=20),
+                            "native-samples",
+                        )
+                        self.assertEqual(
                             self.ray.get(
                                 runner._initialize_components.remote(config),
                                 timeout=20,
@@ -252,6 +269,124 @@ class FullyAsyncRayPatchTests(unittest.TestCase):
                     self.patched[name].__ray_metadata__.method_meta.methods.keys(),
                     actor.__ray_metadata__.method_meta.methods.keys(),
                 )
+
+
+class _FakeBatch:
+    """Minimal full_batch stand-in: the filter only inspects len()."""
+
+    def __init__(self, rows: int):
+        self.rows = rows
+
+    def __len__(self):
+        return self.rows
+
+
+class FullyAsyncTrainerSampleFilterTests(unittest.TestCase):
+    """FT trainer drops partial rollout samples (rows < rollout.n) and keeps
+    waiting instead of assembling a batch that breaks dp divisibility."""
+
+    @classmethod
+    def setUpClass(cls):
+        if importlib.util.find_spec("ray") is None:
+            raise unittest.SkipTest("Ray is not installed")
+        import ray
+
+        cls.ray = ray
+        cls.patched, _ = _build_patched_actors(ray)
+        cls.trainer_cls = cls.patched["FullyAsyncTrainer"].__ray_actor_class__
+        try:
+            import verl.experimental.fully_async_policy.detach_utils  # noqa: F401
+
+            cls._verl_stubs = None
+        except Exception:
+            # No verl: stub the import chain so the patched method's local
+            # import resolves against the fake module injected per-test.
+            cls._verl_stubs = {
+                "verl": ModuleType("verl"),
+                "verl.experimental": ModuleType("verl.experimental"),
+                "verl.experimental.fully_async_policy": ModuleType("verl.experimental.fully_async_policy"),
+                "verl.experimental.fully_async_policy.detach_utils": ModuleType(
+                    "verl.experimental.fully_async_policy.detach_utils"
+                ),
+            }
+
+    def _make_trainer(self, samples, required=2):
+        config = SimpleNamespace(
+            async_training=SimpleNamespace(fault_tolerance=SimpleNamespace(enabled=True)),
+            actor_rollout_ref=SimpleNamespace(rollout=SimpleNamespace(n=2)),
+            trainer=SimpleNamespace(balance_batch=True),
+        )
+        trainer = self.trainer_cls(config)
+        trainer.required_samples = required
+        trainer.tokenizer = "tokenizer"
+        trainer._balance_batch = Mock(name="balance_batch")
+
+        queue = iter(samples)
+
+        class _Queue:
+            async def get_sample(self):
+                try:
+                    return next(queue), 0
+                except StopIteration:
+                    return None, 0
+
+        trainer.message_queue_client = _Queue()
+        return trainer
+
+    def _run(self, trainer):
+        assemble_calls = []
+
+        def _assemble(samples, *args):
+            assemble_calls.append(list(samples))
+            return SimpleNamespace(meta_info={})
+
+        module = ModuleType("verl.experimental.fully_async_policy.detach_utils")
+        module.assemble_batch_from_rollout_samples = Mock(side_effect=_assemble)
+        overrides = dict(self._verl_stubs) if self._verl_stubs else {}
+        overrides["verl.experimental.fully_async_policy.detach_utils"] = module
+        with mock_patch.dict(sys.modules, overrides):
+            result = asyncio.run(trainer._get_samples_from_queue())
+        return result, module.assemble_batch_from_rollout_samples
+
+    def _sample(self, sample_id, rows):
+        return self.ray.cloudpickle.dumps(SimpleNamespace(full_batch=_FakeBatch(rows), sample_id=sample_id))
+
+    def test_partial_samples_dropped_and_collection_continues(self):
+        trainer = self._make_trainer(
+            [
+                self._sample("partial", 1),
+                self._sample("c1", 2),
+                self._sample("c2", 2),
+            ]
+        )
+
+        (epoch, batch), assemble = self._run(trainer)
+
+        self.assertEqual(epoch, 0)
+        self.assertIn("fully_async/total_wait_time", batch.meta_info)
+        assemble.assert_called_once()
+        collected = assemble.call_args[0][0]
+        self.assertEqual([s.sample_id for s in collected], ["c1", "c2"])
+        self.assertEqual(assemble.call_args[0][2], trainer.config)
+        self.assertEqual(assemble.call_args[0][3], trainer._balance_batch)
+
+    def test_termination_signal_returns_none_when_insufficient(self):
+        trainer = self._make_trainer(
+            [
+                self._sample("partial", 1),
+                self._sample("c1", 2),
+            ]
+        )
+
+        result, assemble = self._run(trainer)
+
+        self.assertEqual(result, (None, None))
+        assemble.assert_not_called()
+
+    def test_fault_tolerance_disabled_delegates_to_native(self):
+        trainer = self.trainer_cls(SimpleNamespace())
+
+        self.assertEqual(asyncio.run(trainer._get_samples_from_queue()), "native-samples")
 
 
 class FullyAsyncLauncherTests(unittest.TestCase):

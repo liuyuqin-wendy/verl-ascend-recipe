@@ -1030,6 +1030,91 @@ async def _async_trainer_on_replica_added_from_supervisor(self, new_replica):
         self.checkpoint_manager.add_pending_replicas([new_replica])
 
 
+@patch(FullyAsyncTrainer, "_get_samples_from_queue")
+async def _async_trainer_get_samples_from_queue(self):
+    """FT guard: drop partial rollout samples (rows < rollout.n) instead of
+    assembling them, which would break dp divisibility in ``_balance_batch``
+    and bias GRPO uid groups. Keep waiting for complete ones; ``None`` (the
+    termination signal) still ends collection.
+    """
+    if not OmegaConf.select(self.config, "async_training.fault_tolerance.enabled", default=False):
+        return await self._orig__get_samples_from_queue()
+
+    import logging
+    import time
+
+    import ray
+
+    from verl.experimental.fully_async_policy.detach_utils import assemble_batch_from_rollout_samples
+
+    log = logging.getLogger(__name__)
+    expected_rows = self.config.actor_rollout_ref.rollout.n
+
+    print(
+        f"[FullyAsyncTrainer] Requesting {self.required_samples} samples from queue",
+        flush=True,
+    )
+
+    consumer_start = time.time()
+    queue_samples = []
+    queue_len = 0
+    dropped = 0
+    while len(queue_samples) < self.required_samples:
+        sample, queue_len = await self.message_queue_client.get_sample()
+
+        if sample is None:
+            print(
+                f"[FullyAsyncTrainer] Detected termination signal (None), stopping sample collection. "
+                f"Collected {len(queue_samples)}/{self.required_samples} samples"
+            )
+            break
+
+        rollout_sample = ray.cloudpickle.loads(sample)
+        if len(rollout_sample.full_batch) != expected_rows:
+            dropped += 1
+            log.warning(
+                "[FT] trainer dropped partial rollout sample %s: %d/%d rows (dropped_total=%d)",
+                getattr(rollout_sample, "sample_id", "?"),
+                len(rollout_sample.full_batch),
+                expected_rows,
+                dropped,
+            )
+            continue
+
+        queue_samples.append(rollout_sample)
+
+        if len(queue_samples) % 64 == 0:
+            print(
+                f"[FullyAsyncTrainer] Collected {len(queue_samples)}/{self.required_samples} samples. "
+                f"mq_len: {queue_len}"
+            )
+
+    consumer_end = time.time()
+
+    if not queue_samples or len(queue_samples) < self.required_samples:
+        print("[FullyAsyncTrainer] not enough samples collected after loop")
+        return None, None
+    total_wait_time = consumer_end - consumer_start
+
+    print(
+        f"[FullyAsyncTrainer] Loop collection completed: {len(queue_samples)}/{self.required_samples} samples, "
+        f"total wait time: {total_wait_time:.2f} seconds. "
+        f"mq_len: {queue_len}"
+    )
+
+    if dropped:
+        log.warning("[FT] trainer skipped %d partial rollout sample(s) while collecting this batch", dropped)
+
+    # Assemble batch - now working directly with RolloutSample objects
+    if self.config.trainer.balance_batch:
+        batch = assemble_batch_from_rollout_samples(queue_samples, self.tokenizer, self.config, self._balance_batch)
+    else:
+        batch = assemble_batch_from_rollout_samples(queue_samples, self.tokenizer, self.config, None)
+
+    batch.meta_info["fully_async/total_wait_time"] = total_wait_time
+    return 0, batch
+
+
 # ---------------------------------------------------------------------------
 # fully_async_policy.fully_async_main — FullyAsyncTaskRunner
 # ---------------------------------------------------------------------------
