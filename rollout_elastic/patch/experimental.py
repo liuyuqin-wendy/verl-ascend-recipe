@@ -1269,6 +1269,36 @@ def _ft_training_node_ids_or_warn(config, label: str) -> list[str]:
     return node_ids
 
 
+def _ft_non_inference_scheduling_strategy(config, label: str):
+    """Soft node affinity keeping an actor off inference nodes.
+
+    Inference replicas live in pods that Kubernetes deletes whole on a replica
+    fault, so coordination actors (task runner, LB, progress store) must never
+    colocate with them. Prefer ``trainer_pool`` nodes; before those exist, pin
+    to the driver node, which outlives inference pods. Returns ``None`` when
+    placement is disabled.
+    """
+    if not _ft_placement_enabled(config):
+        return None
+    try:
+        from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
+    except Exception:  # pragma: no cover - defensive: ray without scheduling strategies
+        return None
+
+    node_ids = _ft_training_node_ids_or_warn(config, label)
+    if node_ids:
+        logger.info("[placement] pin %s to training node %s (soft)", label, node_ids[0])
+        return NodeAffinitySchedulingStrategy(node_id=node_ids[0], soft=True)
+    try:
+        node_id = ray.get_runtime_context().get_node_id()
+    except Exception:  # pragma: no cover - defensive: Ray not connected yet
+        return None
+    logger.warning(
+        "[placement] no trainer_pool placement groups found yet; pin %s to the driver node %s (soft)", label, node_id
+    )
+    return NodeAffinitySchedulingStrategy(node_id=node_id, soft=True)
+
+
 class _FtNodeAffinityRemote:
     """Proxy exposing ``.remote()`` that pins the actor to a training node.
 
@@ -1361,54 +1391,38 @@ def _reward_manager_init_workers(orig, self, *args, **kwargs):
 
 
 # ---------------------------------------------------------------------------
-# one-step-off / legacy / fully-async entries: run the TaskRunner in-process
+# one-step-off / legacy / fully-async entries: keep the TaskRunner off
+# inference nodes
 # ---------------------------------------------------------------------------
-# The runner is created before any trainer placement group exists, so
-# training-node affinity cannot apply, and pinning it to the driver node only
-# holds while that node's raylet is alive (soft affinity silently falls back
-# onto inference pods otherwise). The runner is a pure synchronous
-# coordinator, so execute it directly in the driver process — the only
-# placement guaranteed to outlive the inference pods.
+# The runner actor is created before any trainer placement group exists, so
+# training-node affinity cannot apply and native scheduling would let it
+# float onto a CPU-rich inference pod that Kubernetes deletes on fault. Wrap
+# the runner class so it is pinned to a survivable node instead. It must stay
+# a real Ray actor: running it in the driver would import the NPU-dependent
+# worker classes in the (NPU-less) driver process.
 
 
-class _DriverLocalMethod:
-    """Emulates ``ActorMethod.remote`` by running the bound method in-process."""
-
-    def __init__(self, fn):
-        self._fn = fn
-
-    def remote(self, *args, **kwargs):
-        # Block the driver for the whole run, mirroring ray.get(runner.run.remote(config)).
-        return ray.put(self._fn(*args, **kwargs))
-
-
-class _DriverLocalHandle:
-    """Emulates the actor-handle surface consumed by run_ppo (``handle.run.remote``)."""
-
-    def __init__(self, runner):
-        object.__setattr__(self, "_runner", runner)
-
-    def __getattr__(self, name):
-        return _DriverLocalMethod(getattr(self._runner, name))
-
-
-class _DriverLocalTaskRunner:
-    """Emulates the ``@ray.remote`` class surface consumed by ``run_ppo`` while
-    executing runner instances inside the driver process.
+class _FtTaskRunnerRemote:
+    """Proxy exposing ``.remote()`` / ``.options()`` that keeps the task runner
+    off inference nodes (see ``_ft_non_inference_scheduling_strategy``).
 
     ``run_ppo`` only touches ``.remote()`` (plus ``.options(...)`` for the nsys
-    runtime env, which only applies to remote actors) before blocking on
-    ``ray.get(runner.run.remote(config))``.
+    runtime env) before blocking on ``ray.get(runner.run.remote(config))``.
     """
 
-    def __init__(self, cls):
-        self._cls = cls
+    def __init__(self, actor_cls, config, label: str):
+        self._actor_cls = actor_cls
+        self._config = config
+        self._label = label
 
     def options(self, **options):
-        return self
+        strategy = _ft_non_inference_scheduling_strategy(self._config, self._label)
+        if strategy is not None:
+            options["scheduling_strategy"] = strategy
+        return self._actor_cls.options(**options)
 
     def remote(self, *args, **kwargs):
-        return _DriverLocalHandle(self._cls(*args, **kwargs))
+        return self.options().remote(*args, **kwargs)
 
 
 @patch_module_function(verl.trainer.main_ppo, "run_ppo")
@@ -1416,11 +1430,13 @@ def _run_ppo(config, task_runner_class=None):
     if task_runner_class is None:
         # Mirror native main()'s default: the V1 runner (already a Ray actor class).
         task_runner_class = getattr(verl.trainer.main_ppo, "TaskRunnerV1", None)
-    if task_runner_class is not None and _ft_placement_enabled(config):
-        logger.warning("[placement] FT placement: running the task runner inside the driver process")
-        task_runner_class = _DriverLocalTaskRunner(unwrap_ray_remote(task_runner_class))
-    else:
-        logger.warning("[placement] FT placement disabled: task runner scheduled by Ray as a cluster actor")
+    if (
+        task_runner_class is not None
+        and not isinstance(task_runner_class, (_FtNodeAffinityRemote, _FtTaskRunnerRemote))
+        and _ft_placement_enabled(config)
+    ):
+        logger.info("[placement] FT placement: pin the task runner away from inference nodes")
+        task_runner_class = _FtTaskRunnerRemote(task_runner_class, config, "the task runner")
     return verl.trainer.main_ppo._orig_run_ppo(config, task_runner_class)
 
 

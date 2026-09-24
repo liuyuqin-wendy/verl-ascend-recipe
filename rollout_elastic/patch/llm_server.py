@@ -732,31 +732,13 @@ def _ft_coordination_scheduling_strategy(config: Any, label: str):
     """Soft node affinity for coordination actors (LB, progress store).
 
     They must never colocate with inference replicas (K8s deletes the whole
-    pod on a replica fault). Prefer ``trainer_pool`` nodes; before those
-    exist, pin to the driver node, which outlives inference pods. Returns
-    ``None`` when placement is disabled.
+    pod on a replica fault). See
+    ``experimental._ft_non_inference_scheduling_strategy`` for the placement
+    policy; returns ``None`` when placement is disabled.
     """
-    from .experimental import _ft_placement_enabled, _ft_training_node_ids_or_warn
+    from .experimental import _ft_non_inference_scheduling_strategy
 
-    if not _ft_placement_enabled(config):
-        return None
-    try:
-        from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
-    except Exception:  # pragma: no cover - defensive: ray without scheduling strategies
-        return None
-
-    node_ids = _ft_training_node_ids_or_warn(config, label)
-    if node_ids:
-        logger.info("[placement] pin %s to training node %s (soft)", label, node_ids[0])
-        return NodeAffinitySchedulingStrategy(node_id=node_ids[0], soft=True)
-    try:
-        node_id = ray.get_runtime_context().get_node_id()
-    except Exception:  # pragma: no cover - defensive: Ray not connected yet
-        return None
-    logger.warning(
-        "[placement] no trainer_pool placement groups found yet; pin %s to the driver node %s (soft)", label, node_id
-    )
-    return NodeAffinitySchedulingStrategy(node_id=node_id, soft=True)
+    return _ft_non_inference_scheduling_strategy(config, label)
 
 
 @add(LLMServerManager, "_init_progress_store")
