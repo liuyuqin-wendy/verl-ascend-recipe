@@ -44,6 +44,7 @@ from pprint import pprint
 import ray
 from omegaconf import OmegaConf
 
+import verl.trainer.main_ppo
 from verl.checkpoint_engine import CheckpointEngineManager
 from verl.experimental.agent_loop.agent_loop import (
     AgentLoopManager,
@@ -73,7 +74,7 @@ from verl.utils.tracking import Tracking
 from verl.workers.rollout.fault_tolerance import filter_partial_batch
 from verl.workers.rollout.llm_server import LLMServerManager
 
-from ._core import add, patch, unwrap_ray_remote, wrap
+from ._core import add, patch, patch_module_function, unwrap_ray_remote, wrap
 
 logger = logging.getLogger(__name__)
 
@@ -262,7 +263,9 @@ def _sep_trainer_init_workers(self):
     self.checkpoint_manager = CheckpointEngineManager(
         config=omega_conf_to_dataclass(self.config.actor_rollout_ref.rollout.checkpoint_engine),
         trainer=self.actor_rollout_wg,
-        replicas=self.llm_server_manager.get_replicas(),
+        # Copy: get_replicas() returns the manager's live rollout_replicas list;
+        # CKE would prune it in place on replica death, breaking spawn_replacement.
+        replicas=list(self.llm_server_manager.get_replicas()),
         fault_tolerance=ft_cfg,
         load_balancer_handle=self.llm_server_manager.global_load_balancer,
     )
@@ -1259,7 +1262,7 @@ def _ft_training_node_ids_or_warn(config, label: str) -> list[str]:
             known = []
         logger.warning(
             "[placement] fault tolerance is enabled but no trainer_pool placement groups "
-            "found yet (known PGs: %s); %s will fall back to native scheduling and may land on inference nodes",
+            "found yet (known PGs: %s); %s will not be pinned to training nodes and may land on inference nodes",
             known or "none",
             label,
         )
@@ -1269,11 +1272,11 @@ def _ft_training_node_ids_or_warn(config, label: str) -> list[str]:
 class _FtNodeAffinityRemote:
     """Proxy exposing ``.remote()`` that pins the actor to a training node.
 
-    Falls through to native scheduling when placement is disabled or no
-    ``trainer_pool`` placement group exists yet (e.g. the trainer actor
-    itself, which is created before its own resource pools — documented
-    limitation: that coordinator may still land on an inference node unless
-    the deployment pre-creates the trainer pools).
+    Falls through to native scheduling when placement is disabled. When fault
+    tolerance is on but no ``trainer_pool`` placement group exists yet (e.g.
+    the trainer actor, which is created before its own resource pools), the
+    actor is pinned to the driver node instead — native scheduling would let
+    it float onto a CPU-rich inference pod that Kubernetes deletes on fault.
     """
 
     def __init__(self, actor_cls, label: str):
@@ -1285,12 +1288,21 @@ class _FtNodeAffinityRemote:
         config = kwargs.get("config")
         if config is None and args:
             config = args[0]
-        node_ids = _ft_training_node_ids_or_warn(config, f"the {self._label} actor")
-        if not node_ids:
+        if not _ft_placement_enabled(config):
             return self._actor_cls.remote(*args, **kwargs)
-        node_id = node_ids[self._index % len(node_ids)]
-        self._index += 1
-        logger.info("[placement] pin %s to training node %s (soft)", self._label, node_id)
+        node_ids = _ft_training_node_ids_or_warn(config, f"the {self._label} actor")
+        if node_ids:
+            node_id = node_ids[self._index % len(node_ids)]
+            self._index += 1
+            logger.info("[placement] pin %s to training node %s (soft)", self._label, node_id)
+        else:
+            # No trainer pools yet: the driver node is the only placement
+            # guaranteed to outlive the rescheduled inference pods.
+            try:
+                node_id = ray.get_runtime_context().get_node_id()
+            except Exception:  # pragma: no cover - defensive: Ray not connected yet
+                return self._actor_cls.remote(*args, **kwargs)
+            logger.info("[placement] pin %s to the driver node %s (soft)", self._label, node_id)
         return self._actor_cls.options(
             scheduling_strategy=ray.util.scheduling_strategies.NodeAffinitySchedulingStrategy(
                 node_id=node_id, soft=True
@@ -1348,6 +1360,70 @@ def _reward_manager_init_workers(orig, self, *args, **kwargs):
     logger.info("[placement] placed %d reward loop workers on training nodes %s", num_workers, node_ids)
 
 
+# ---------------------------------------------------------------------------
+# one-step-off / legacy / fully-async entries: run the TaskRunner in-process
+# ---------------------------------------------------------------------------
+# The runner is created before any trainer placement group exists, so
+# training-node affinity cannot apply, and pinning it to the driver node only
+# holds while that node's raylet is alive (soft affinity silently falls back
+# onto inference pods otherwise). The runner is a pure synchronous
+# coordinator, so execute it directly in the driver process — the only
+# placement guaranteed to outlive the inference pods.
+
+
+class _DriverLocalMethod:
+    """Emulates ``ActorMethod.remote`` by running the bound method in-process."""
+
+    def __init__(self, fn):
+        self._fn = fn
+
+    def remote(self, *args, **kwargs):
+        # Block the driver for the whole run, mirroring ray.get(runner.run.remote(config)).
+        return ray.put(self._fn(*args, **kwargs))
+
+
+class _DriverLocalHandle:
+    """Emulates the actor-handle surface consumed by run_ppo (``handle.run.remote``)."""
+
+    def __init__(self, runner):
+        object.__setattr__(self, "_runner", runner)
+
+    def __getattr__(self, name):
+        return _DriverLocalMethod(getattr(self._runner, name))
+
+
+class _DriverLocalTaskRunner:
+    """Emulates the ``@ray.remote`` class surface consumed by ``run_ppo`` while
+    executing runner instances inside the driver process.
+
+    ``run_ppo`` only touches ``.remote()`` (plus ``.options(...)`` for the nsys
+    runtime env, which only applies to remote actors) before blocking on
+    ``ray.get(runner.run.remote(config))``.
+    """
+
+    def __init__(self, cls):
+        self._cls = cls
+
+    def options(self, **options):
+        return self
+
+    def remote(self, *args, **kwargs):
+        return _DriverLocalHandle(self._cls(*args, **kwargs))
+
+
+@patch_module_function(verl.trainer.main_ppo, "run_ppo")
+def _run_ppo(config, task_runner_class=None):
+    if task_runner_class is None:
+        # Mirror native main()'s default: the V1 runner (already a Ray actor class).
+        task_runner_class = getattr(verl.trainer.main_ppo, "TaskRunnerV1", None)
+    if task_runner_class is not None and _ft_placement_enabled(config):
+        logger.warning("[placement] FT placement: running the task runner inside the driver process")
+        task_runner_class = _DriverLocalTaskRunner(unwrap_ray_remote(task_runner_class))
+    else:
+        logger.warning("[placement] FT placement disabled: task runner scheduled by Ray as a cluster actor")
+    return verl.trainer.main_ppo._orig_run_ppo(config, task_runner_class)
+
+
 # Refresh Ray's wrappers and method tables only after all decorators complete.
 # Reuse the original Python classes to preserve identity, inheritance and super().
 FullyAsyncRollouter = ray.remote(num_cpus=10, max_concurrency=100)(unwrap_ray_remote(FullyAsyncRollouter))
@@ -1360,9 +1436,8 @@ fully_async_main.FullyAsyncTrainer = FullyAsyncTrainer
 FullyAsyncTaskRunner = ray.remote(num_cpus=1)(unwrap_ray_remote(FullyAsyncTaskRunner))
 fully_async_main.FullyAsyncTaskRunner = FullyAsyncTaskRunner
 
-# Placement: pin the top-level CPU coordinators to training nodes. The trainer
-# actor is created before its own resource pools exist, so its candidate set is
-# empty at that point and the wrapper falls through to native scheduling
-# (documented limitation, see _FtNodeAffinityRemote).
+# Placement: pin the top-level CPU coordinators to training nodes; the
+# trainer_pool groups exist by the time these actors are created (see
+# _FtNodeAffinityRemote).
 fully_async_main.FullyAsyncRollouter = _FtNodeAffinityRemote(FullyAsyncRollouter, "fully_async_rollouter")
 fully_async_main.FullyAsyncTrainer = _FtNodeAffinityRemote(FullyAsyncTrainer, "fully_async_trainer")

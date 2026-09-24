@@ -728,19 +728,44 @@ def _resolve_max_model_len(self) -> Optional[int]:
     return None
 
 
+def _ft_coordination_scheduling_strategy(config: Any, label: str):
+    """Soft node affinity for coordination actors (LB, progress store).
+
+    They must never colocate with inference replicas (K8s deletes the whole
+    pod on a replica fault). Prefer ``trainer_pool`` nodes; before those
+    exist, pin to the driver node, which outlives inference pods. Returns
+    ``None`` when placement is disabled.
+    """
+    from .experimental import _ft_placement_enabled, _ft_training_node_ids_or_warn
+
+    if not _ft_placement_enabled(config):
+        return None
+    try:
+        from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
+    except Exception:  # pragma: no cover - defensive: ray without scheduling strategies
+        return None
+
+    node_ids = _ft_training_node_ids_or_warn(config, label)
+    if node_ids:
+        logger.info("[placement] pin %s to training node %s (soft)", label, node_ids[0])
+        return NodeAffinitySchedulingStrategy(node_id=node_ids[0], soft=True)
+    try:
+        node_id = ray.get_runtime_context().get_node_id()
+    except Exception:  # pragma: no cover - defensive: Ray not connected yet
+        return None
+    logger.warning(
+        "[placement] no trainer_pool placement groups found yet; pin %s to the driver node %s (soft)", label, node_id
+    )
+    return NodeAffinitySchedulingStrategy(node_id=node_id, soft=True)
+
+
 @add(LLMServerManager, "_init_progress_store")
 async def _init_progress_store(self, progress_cfg) -> None:
     """Mode C: create and initialise the StoreActor. Called during FT assembly."""
-    from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
-
     from verl.workers.rollout.fault_tolerance import RolloutProgressStoreActor
 
-    try:
-        node_id = ray.get_runtime_context().get_node_id()
-        scheduling_strategy = NodeAffinitySchedulingStrategy(node_id=node_id, soft=True)
-    except Exception:
-        scheduling_strategy = None
     options = {"max_restarts": 3, "max_task_retries": 3}
+    scheduling_strategy = _ft_coordination_scheduling_strategy(self.config, "the progress store actor")
     if scheduling_strategy is not None:
         options["scheduling_strategy"] = scheduling_strategy
     self._progress_store = RolloutProgressStoreActor.options(**options).remote()
@@ -774,14 +799,8 @@ async def _init_global_load_balancer(self) -> None:
         await self._orig__init_global_load_balancer()
         return
 
-    try:
-        from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
-
-        node_id = ray.get_runtime_context().get_node_id()
-        scheduling_strategy = NodeAffinitySchedulingStrategy(node_id=node_id, soft=True)
-    except Exception:
-        scheduling_strategy = None
     options: dict[str, Any] = {"max_restarts": 3, "max_task_retries": 3}
+    scheduling_strategy = _ft_coordination_scheduling_strategy(self.config, "the global load balancer")
     if scheduling_strategy is not None:
         options["scheduling_strategy"] = scheduling_strategy
     self.global_load_balancer = ElasticGlobalRequestLoadBalancer.options(**options).remote(
