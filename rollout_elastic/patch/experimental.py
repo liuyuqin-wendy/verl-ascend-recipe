@@ -80,6 +80,22 @@ from ._core import add, patch, patch_module_function, unwrap_ray_remote, wrap
 logger = logging.getLogger(__name__)
 
 
+def _ft_build_fault_tolerance_config(config):
+    """Build ``FaultToleranceConfig`` from ``async_training.fault_tolerance``.
+
+    Returns ``None`` when the section is absent. Errors are NOT swallowed:
+    a malformed section (unknown key, bad nested value) must fail the run
+    loudly — silently treating it as disabled would drop Supervisor/CKE
+    protection unnoticed.
+    """
+    from verl.workers.rollout.fault_tolerance import FaultToleranceConfig
+
+    ft_node = OmegaConf.select(config, "async_training.fault_tolerance")
+    if ft_node is None:
+        return None
+    return FaultToleranceConfig(**OmegaConf.to_container(ft_node, resolve=True))
+
+
 # ---------------------------------------------------------------------------
 # agent_loop — AgentLoopWorker
 # ---------------------------------------------------------------------------
@@ -249,15 +265,7 @@ def _sep_trainer_init_workers(self):
     else:
         from verl.checkpoint_engine import CheckpointEngineManager
 
-    ft_cfg = None
-    try:
-        from verl.workers.rollout.fault_tolerance import FaultToleranceConfig
-
-        ft_node = OmegaConf.select(self.config, "async_training.fault_tolerance")
-        if ft_node is not None:
-            ft_cfg = FaultToleranceConfig(**OmegaConf.to_container(ft_node, resolve=True))
-    except Exception:
-        ft_cfg = None
+    ft_cfg = _ft_build_fault_tolerance_config(self.config)
 
     from verl.utils.config import omega_conf_to_dataclass
 
@@ -687,20 +695,7 @@ async def _rollouter_init_ft_supervisor(self, trainer_handle):
     self._trainer_handle = trainer_handle
     _ft_log = _ft_logging.getLogger(__name__)
 
-    ft_cfg = None
-    try:
-        from verl.workers.rollout.fault_tolerance import FaultToleranceConfig
-
-        ft_node = OmegaConf.select(self.config, "async_training.fault_tolerance")
-        if ft_node is not None:
-            ft_cfg = FaultToleranceConfig(**OmegaConf.to_container(ft_node, resolve=True))
-    except Exception as _e:
-        _ft_log.warning(
-            "[FT] init_ft_supervisor: failed to build FaultToleranceConfig: %r — treating as disabled",
-            _e,
-            exc_info=True,
-        )
-        ft_cfg = None
+    ft_cfg = _ft_build_fault_tolerance_config(self.config)
 
     self._ft_supervisor = None
     if ft_cfg is None or not ft_cfg.enabled:
@@ -975,15 +970,7 @@ def _async_trainer_setup_checkpoint_manager(self, rollouter):
     checkpoint_engine_config = omega_conf_to_dataclass(self.config.actor_rollout_ref.rollout.checkpoint_engine)
 
     # FT: read fault_tolerance config + fetch LB handle from rollouter
-    ft_cfg = None
-    try:
-        from verl.workers.rollout.fault_tolerance import FaultToleranceConfig
-
-        ft_node = OmegaConf.select(self.config, "async_training.fault_tolerance")
-        if ft_node is not None:
-            ft_cfg = FaultToleranceConfig(**OmegaConf.to_container(ft_node, resolve=True))
-    except Exception:
-        ft_cfg = None
+    ft_cfg = _ft_build_fault_tolerance_config(self.config)
 
     lb_handle = None
     try:
@@ -1221,6 +1208,12 @@ def _async_main_initialize_components(self, config) -> None:
 # - Standalone rollout placement groups (CKE workers + the vLLM HTTP servers
 #   that follow them) use a strict rollout-label constraint; native
 #   scheduling would otherwise let them land on trainer nodes.
+# - Every other placement group (training GPU workers, CPU coordination
+#   pools) uses a strict trainer-label constraint; otherwise a training
+#   bundle could occupy a rollout pod, which must only ever run
+#   inference-instance processes, and the rollout PG would stay pending.
+# Requires Ray >= 2.49 for placement-group bundle_label_selector; enforced
+# by _ft_check_ray_label_support at startup.
 # Hybrid (colocated) rollout keeps native scheduling: it shares the trainer
 # pool by design.
 
@@ -1234,6 +1227,34 @@ def _ft_placement_enabled(config) -> bool:
     return OmegaConf.select(config, "async_training.fault_tolerance.placement.enabled", default=True)
 
 
+def _ft_check_ray_label_support() -> None:
+    """Fail fast when the running Ray cannot schedule by node labels.
+
+    Placement groups accept ``bundle_label_selector`` only from Ray 2.49
+    (see the Ray node-labels docs); verl's floor (>= 2.41) is NOT enough.
+    Runs once per process, at first activation of placement.
+    """
+    if getattr(_ft_check_ray_label_support, "_checked", False):
+        return
+    import re
+
+    version = getattr(ray, "__version__", "") or ""
+    match = re.match(r"(\d+)\.(\d+)", version)
+    if match is None:
+        logger.warning(
+            "[placement] cannot parse Ray version %r; skipping the node-label support check "
+            "(placement requires Ray >= 2.49)",
+            version,
+        )
+    elif (int(match.group(1)), int(match.group(2))) < (2, 49):
+        raise RuntimeError(
+            f"[placement] Ray {version} does not support placement-group bundle_label_selector "
+            "(requires Ray >= 2.49; the pinned test environment is Ray 2.55.1). Upgrade Ray or set "
+            "async_training.fault_tolerance.placement.enabled=False."
+        )
+    _ft_check_ray_label_support._checked = True
+
+
 _ft_label_cfg = None
 
 
@@ -1242,6 +1263,7 @@ def _ft_cache_label_config(config) -> None:
     global _ft_label_cfg
     if config is None or not _ft_placement_enabled(config):
         return
+    _ft_check_ray_label_support()
     _ft_label_cfg = {
         "key": OmegaConf.select(
             config, "async_training.fault_tolerance.placement.node_label_key", default="verl.io/role"
@@ -1263,7 +1285,8 @@ def _ft_non_inference_scheduling_strategy(config, label: str):
 
     Returns ``None`` when placement is disabled, the label key/value is empty
     (disables the constraint), or the Ray runtime cannot express node-label
-    constraints (Ray < 2.36; verl requires >= 2.41 so this is defensive only).
+    constraints (missing from very old Ray; placement as a whole requires
+    >= 2.49 anyway, enforced by ``_ft_check_ray_label_support``).
     """
     _ft_cache_label_config(config)
     if not _ft_placement_enabled(config):
@@ -1308,8 +1331,10 @@ def _ft_rollout_pg_label_selector(name_prefix: str):
     """Per-bundle label selector pinning a placement group to rollout nodes.
 
     Applies only to standalone-rollout pools (names starting with
-    ``rollout``). Returns ``None`` for other pools, when placement is off, or
-    when the rollout label value is empty (disables the constraint).
+    ``rollout``). Returns ``None`` for other pools (they are pinned to
+    trainer nodes by ``_ft_trainer_pg_label_selector``), when no label
+    config is cached, or when the rollout label value is empty (disables
+    the constraint).
     """
     if not name_prefix.startswith("rollout"):
         return None
@@ -1327,13 +1352,59 @@ def _ft_rollout_pg_label_selector(name_prefix: str):
     return {key: value}
 
 
-def _ft_rollout_get_placement_groups(self, selector, strategy="STRICT_PACK", name=None, device_name="cuda"):
+def _ft_trainer_pg_label_selector(name_prefix: str):
+    """Per-bundle label selector pinning a (non-rollout) pool to trainer nodes.
+
+    Training GPU workers share ``trainer_pool``; reward/teacher pools and any
+    other non-rollout pool stay on trainer nodes too, so no training bundle
+    can ever occupy a rollout pod. Returns ``None`` for standalone-rollout
+    pools (handled by ``_ft_rollout_pg_label_selector``), when no label config
+    is cached, or when the trainer label value is empty.
+    """
+    if name_prefix.startswith("rollout"):
+        return None
+    cfg = globals().get("_ft_label_cfg")  # globals().get: also safe under partial-module exec (tests)
+    if not cfg:
+        # run_ppo never ran with a config (custom entry point): stay native.
+        if not getattr(_ft_trainer_pg_label_selector, "_no_cfg_warned", False):
+            _ft_trainer_pg_label_selector._no_cfg_warned = True
+            logger.warning("[placement] no label config cached; pool %s uses native scheduling", name_prefix)
+        return None
+    key, value = cfg["key"], cfg["trainer"]
+    if not key or not value:
+        return None
+    logger.info("[placement] schedule pool %s on nodes labelled %s=%s (strict)", name_prefix, key, value)
+    return {key: value}
+
+
+def _ft_require_labelled_node(key: str, value: str, what: str):
+    """Check that at least one alive node carries the strict role label.
+
+    Returns ``(ok, cluster_detail)``; callers turn a miss into a loud,
+    self-explanatory failure instead of a silently pending placement group.
+    """
+    try:
+        nodes = ray.nodes()
+    except Exception:  # pragma: no cover - defensive: no cluster metadata yet
+        nodes = []
+    for node in nodes:
+        if node.get("Alive") and (node.get("Labels") or {}).get(key) == value:
+            return True, ""
+    detail = (
+        "; ".join(f"{node.get('NodeManagerAddress', '?')}: {(node.get('Labels') or {}).get(key)!r}" for node in nodes)
+        or "no nodes registered"
+    )
+    return False, detail
+
+
+def _ft_labelled_get_placement_groups(self, selector, what, strategy="STRICT_PACK", name=None, device_name="cuda"):
     """Native ``RayResourcePool.get_placement_groups`` plus a label selector.
 
     Mirrors verl's implementation verbatim; the only addition is
-    ``bundle_label_selector`` so every bundle lands on a rollout-labelled
-    node (Ray >= 2.36; older Ray ignores nothing — it rejects the kwarg, but
-    verl requires >= 2.41 so this is safe).
+    ``bundle_label_selector`` so every bundle lands on a node labelled for
+    the pool's role (``what``: "rollout" or "trainer").
+    ``bundle_label_selector`` requires Ray >= 2.49 — enforced by
+    ``_ft_check_ray_label_support`` at startup.
     """
     from ray.util.placement_group import placement_group
 
@@ -1344,6 +1415,17 @@ def _ft_rollout_get_placement_groups(self, selector, strategy="STRICT_PACK", nam
     pg_name_prefix = (
         name if name else f"{self.name_prefix}verl_group_{'_'.join([str(count) for count in self._store])}:"
     )
+    key, value = next(iter(selector.items()))
+    ok, detail = _ft_require_labelled_node(key, value, what)
+    if not ok:
+        # Strict whitelist isolation: no native-scheduling fallback, so a
+        # mislabelled cluster must fail loudly rather than silently place
+        # the workload on the wrong pool (or hang forever pending).
+        raise RuntimeError(
+            f"[placement] no alive node carries label {key}={value} for the {what} placement group "
+            f"'{pg_name_prefix}' (alive nodes: {detail}). Add the node with "
+            f'\'ray start --labels={{"{key}": "{value}"}}\' to unblock.'
+        )
     if device_name == "npu":
         device_name = "NPU"
     elif device_name == "cuda":
@@ -1372,11 +1454,33 @@ def _ft_rollout_get_placement_groups(self, selector, strategy="STRICT_PACK", nam
 
 @wrap(RayResourcePool, "get_placement_groups")
 def _ft_resource_pool_get_placement_groups(orig, self, *args, **kwargs):
-    """Create standalone-rollout placement groups on rollout-labelled nodes."""
+    """Create placement groups on role-labelled nodes.
+
+    Standalone-rollout pools (``rollout*``) land on rollout nodes; every
+    other pool — training GPU workers and the CPU coordination pools — lands
+    on trainer nodes, so a training bundle can never occupy a rollout pod.
+    """
     selector = _ft_rollout_pg_label_selector(self.name_prefix)
+    what = "rollout"
+    if selector is None:
+        selector = _ft_trainer_pg_label_selector(self.name_prefix)
+        what = "trainer"
     if selector is None:
         return orig(self, *args, **kwargs)
-    return _ft_rollout_get_placement_groups(self, selector, *args, **kwargs)
+    return _ft_labelled_get_placement_groups(self, selector, what, *args, **kwargs)
+
+
+@wrap(SeparateRayPPOTrainer, "_init_resource_pools")
+def _ft_cache_labels_before_resource_pools(orig, self, *args, **kwargs):
+    """Cache the role-label config right before resource pools create PGs.
+
+    The process that creates placement groups (the trainer actor) may never
+    have gone through ``run_ppo``/a reward manager; without this, its PGs
+    would silently fall back to native scheduling. Also covers the
+    fully-async trainer, which inherits ``_init_resource_pools``.
+    """
+    _ft_cache_label_config(self.config)
+    return orig(self, *args, **kwargs)
 
 
 class _FtNonInferenceRemote:
@@ -1484,8 +1588,9 @@ class _FtTaskRunnerRemote:
 def _run_ppo(config, task_runner_class=None):
     _ft_cache_label_config(config)
     if task_runner_class is None:
-        # Mirror native main()'s default: the V1 runner (already a Ray actor class).
-        task_runner_class = getattr(verl.trainer.main_ppo, "TaskRunnerV1", None)
+        # Mirror native main()'s default: the runner class is already a Ray
+        # actor class on the pinned verl baseline (there is no V1 class).
+        task_runner_class = getattr(verl.trainer.main_ppo, "TaskRunner", None)
     if (
         task_runner_class is not None
         and not isinstance(task_runner_class, (_FtNonInferenceRemote, _FtTaskRunnerRemote))

@@ -41,6 +41,9 @@ def _build_patched_actors(ray):
         def __init__(self, config):
             self.config = config
 
+        def _init_resource_pools(self):
+            return "native-resource-pools"
+
     class NativeRollouter(Separate):
         def __init__(self, config):
             super().__init__(config)
@@ -418,15 +421,20 @@ class FullyAsyncTrainerSampleFilterTests(unittest.TestCase):
 
     def test_rollout_pg_label_selector(self):
         selector_fn = self.patched["_ft_rollout_pg_label_selector"]
+        trainer_selector_fn = self.patched["_ft_trainer_pg_label_selector"]
 
         # No cached config (run_ppo never ran): stay native.
         saved = self.patched.get("_ft_label_cfg")
         self.patched["_ft_label_cfg"] = None
         self.assertIsNone(selector_fn("trainer_pool"))
         self.assertIsNone(selector_fn("rollout_pool_0abc"))  # warns once, stays native
+        self.assertIsNone(trainer_selector_fn("rollout_pool_0abc"))
+        self.assertIsNone(trainer_selector_fn("trainer_pool"))  # warns once, stays native
 
-        # Cached config: standalone-rollout pools get the strict selector,
-        # every other pool keeps native scheduling.
+        # Cached config: standalone-rollout pools get the rollout selector,
+        # every other pool (training GPU workers, CPU coordination pools)
+        # gets the trainer selector, so no training bundle can occupy a
+        # rollout pod.
         self.patched["_ft_label_cfg"] = {"key": "verl.io/role", "trainer": "trainer", "rollout": "rollout"}
         self.assertIsNone(selector_fn("trainer_pool"))
         self.assertIsNone(selector_fn("reward_pool"))
@@ -434,10 +442,16 @@ class FullyAsyncTrainerSampleFilterTests(unittest.TestCase):
         self.assertEqual(selector_fn("rollout_pool_0abc"), {"verl.io/role": "rollout"})
         self.assertEqual(selector_fn("rollout_reward_pool_0abc"), {"verl.io/role": "rollout"})
         self.assertEqual(selector_fn("rollout_teacher_pool_0abc"), {"verl.io/role": "rollout"})
+        self.assertIsNone(trainer_selector_fn("rollout_pool_0abc"))
+        self.assertEqual(trainer_selector_fn("trainer_pool"), {"verl.io/role": "trainer"})
+        self.assertEqual(trainer_selector_fn("reward_pool"), {"verl.io/role": "trainer"})
+        self.assertEqual(trainer_selector_fn("teacher_pool"), {"verl.io/role": "trainer"})
 
-        # Empty rollout value disables the constraint.
+        # Empty value disables the corresponding constraint.
         self.patched["_ft_label_cfg"] = {"key": "verl.io/role", "trainer": "trainer", "rollout": ""}
         self.assertIsNone(selector_fn("rollout_pool_0abc"))
+        self.patched["_ft_label_cfg"] = {"key": "verl.io/role", "trainer": "", "rollout": "rollout"}
+        self.assertIsNone(trainer_selector_fn("trainer_pool"))
         self.patched["_ft_label_cfg"] = saved
 
     def test_rollout_pg_created_with_label_selector(self):
@@ -467,17 +481,33 @@ class FullyAsyncTrainerSampleFilterTests(unittest.TestCase):
             return FakePG(ready_ref=self.ray.put(1), **kwargs)
 
         saved = self.patched.get("_ft_label_cfg")
+        saved_nodes = self.ray.nodes
         self.patched["_ft_label_cfg"] = {"key": "verl.io/role", "trainer": "trainer", "rollout": "rollout"}
+
+        # The strict whitelist check must see alive nodes carrying the role
+        # labels (a real cluster would; stand two in here).
+        self.ray.nodes = lambda: [
+            {"Alive": True, "NodeManagerAddress": "10.0.0.1", "Labels": {"verl.io/role": "trainer"}},
+            {"Alive": True, "NodeManagerAddress": "10.0.0.2", "Labels": {"verl.io/role": "rollout"}},
+        ]
         orig_create, orig_sort = pg_module.placement_group, ray_base.sort_placement_group_by_node_ip
         pg_module.placement_group = fake_placement_group
         ray_base.sort_placement_group_by_node_ip = lambda pgs: pgs
         try:
-            # Trainer pool: native path, no selector.
+            # Trainer pool: every bundle pinned to trainer nodes (a training
+            # bundle must never occupy a rollout pod).
             trainer_pool = pool_cls()
             trainer_pool.name_prefix = "trainer_pool"
-            self.assertEqual(trainer_pool.get_placement_groups(), "native-pgs")
+            trainer_pool.get_placement_groups()
+            self.assertEqual(
+                captured["bundle_label_selector"], [{"verl.io/role": "trainer"}] * len(captured["bundles"])
+            )
+            self.assertEqual(captured["bundles"], [{"CPU": 3, "GPU": 1}] * 2)
+            self.assertTrue(captured["name"].startswith("trainer_pool"))
 
-            # Standalone rollout pool: every bundle carries the label selector.
+            captured.clear()
+
+            # Standalone rollout pool: every bundle carries the rollout selector.
             rollout_pool = pool_cls()
             rollout_pool.name_prefix = "rollout_pool_0abc"
             rollout_pool.get_placement_groups()
@@ -492,6 +522,7 @@ class FullyAsyncTrainerSampleFilterTests(unittest.TestCase):
         finally:
             pg_module.placement_group = orig_create
             ray_base.sort_placement_group_by_node_ip = orig_sort
+            self.ray.nodes = saved_nodes
             self.patched["_ft_label_cfg"] = saved
 
 

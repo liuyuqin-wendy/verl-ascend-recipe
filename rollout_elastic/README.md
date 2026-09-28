@@ -130,6 +130,8 @@ async_training:
     #                              progress store).
     #   rollout nodes: "rollout" — standalone rollout replicas (CKE workers and
     #                              the vLLM HTTP servers that follow them).
+    # Requires Ray >= 2.49 (placement-group bundle_label_selector; the pinned
+    # test environment uses Ray 2.55.1). Startup fails fast on older Ray.
     # Hybrid (colocated) rollout keeps native scheduling: it shares the
     # trainer pool by design.
     placement:
