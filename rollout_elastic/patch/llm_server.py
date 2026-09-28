@@ -27,7 +27,9 @@ This area replaces the LB actor and extends the native client/manager classes:
   (retry on a fresh server) and token-continuation aware (mode C).
 - ``LLMServerManager``: tracks a process-level ``run_id``, can assemble the
   ``RolloutProgressStoreActor``, and can spawn replacement replicas
-  (``spawn_replacement`` / ``_reclaim_ray_resources``).
+  (``spawn_replacement`` / ``_reclaim_ray_resources``). Its control-plane
+  ``clear_kv_cache`` isolates transient rollout faults via the trainer-wired
+  callback (one-step) instead of failing the weight-sync step.
 
 The LB actor is defined completely before Ray decorates it. The core and retry
 client live under ``fault_tolerance``; native clients and the manager are extended
@@ -48,6 +50,7 @@ import ray
 import torch
 from omegaconf import DictConfig, OmegaConf
 
+from verl.utils.ray_utils import auto_await
 from verl.utils.rollout_trace import rollout_trace_op
 from verl.utils.tokenizer import normalize_token_ids
 from verl.workers.rollout.llm_server import (
@@ -821,6 +824,72 @@ def get_client(self, fully_async: bool = False, retry: bool = False) -> LLMServe
 
         return RetryLLMServerClient(**common)
     return LLMServerClient(config=self.config, servers=servers, load_balancer_handle=self.global_load_balancer)
+
+
+@patch(LLMServerManager, "clear_kv_cache")
+@auto_await
+async def _manager_clear_kv_cache(self) -> None:
+    """FT-aware KV-cache clear: isolate transient rollout faults, keep survivors.
+
+    The native method gathers over every replica in ``rollout_replicas`` and
+    lets the first failure fail the whole call. The Manager deliberately keeps
+    dead replicas listed (``spawn_replacement`` needs the old object), so the
+    one-step trainer's post-sync clear would raise ActorDiedError and kill the
+    training loop while a replacement is still being spawned.
+
+    With FT on, transient rollout faults (``is_transient_fault``) are handed to
+    ``_ft_clear_kv_fault_callback`` — wired by the trainer's Supervisor wiring
+    (one-step only; fully-async never calls this control-plane clear). Ordinary
+    code bugs, cancellation signals, a missing callback, or a failed isolation
+    all propagate: a control-plane clear must never be silently "successful"
+    when nothing was cleared.
+    """
+    callback = getattr(self, "_ft_clear_kv_fault_callback", None)
+    if not self._ft_enabled() or callback is None:
+        return await self._orig_clear_kv_cache()
+
+    from verl.workers.rollout.fault_tolerance.exceptions import is_transient_fault
+
+    # Snapshot: CKE prunes its own member copy; the Manager list must stay
+    # untouched so spawn_replacement can still find the dead replica object.
+    replicas = list(self.rollout_replicas)
+    results = await asyncio.gather(*[replica.clear_kv_cache() for replica in replicas], return_exceptions=True)
+
+    transient: list[tuple[Any, BaseException]] = []
+    fatal: list[BaseException] = []
+    for replica, exc in zip(replicas, results, strict=True):
+        if not isinstance(exc, BaseException):
+            continue
+        if isinstance(exc, asyncio.CancelledError):
+            raise exc
+        if is_transient_fault(exc):
+            transient.append((replica, exc))
+        else:
+            fatal.append(exc)
+
+    if fatal:
+        # Not a rollout fault (ordinary exception inside a replica clear):
+        # isolating it would hide a real bug — propagate as-is.
+        raise fatal[0]
+
+    for replica, exc in transient:
+        replica_id = replica._server_address
+        try:
+            await callback(replica_id)
+        except Exception as cb_exc:
+            # Un-isolated (Supervisor not running / LB unreachable): surface the
+            # original fault chained with the isolation failure — never swallow.
+            raise exc from cb_exc
+        logger.warning(
+            "[FT] clear_kv_cache: replica %s failed (%r); isolated, surviving replicas continue",
+            replica_id,
+            exc,
+        )
+
+    if len(transient) == len(replicas):
+        # Every replica failed: the rollout tier is gone. Isolation has been
+        # attempted, but this must not masquerade as a successful clear.
+        raise transient[0][1]
 
 
 @add(LLMServerManager, "spawn_replacement")

@@ -340,6 +340,28 @@ def _sep_trainer_init_workers(self):
         self._ft_supervisor = ThreadedSupervisor(inner_sup)
         self.checkpoint_manager.set_sync_failure_reporter(self._ft_supervisor.report_failure)
         self.checkpoint_manager.set_replica_promotion_reporter(self._ft_supervisor.promote_replica)
+
+        # one-step control-plane faults: LLMServerManager.clear_kv_cache hands
+        # transient rollout faults here instead of failing the weight-sync step
+        # (the Manager keeps dead replicas listed for spawn_replacement). Fixed
+        # order — the Supervisor must be running (report_failure silently no-ops
+        # otherwise), LB isolation first so new acquires stop routing to the
+        # dead replica, then the idempotent report that drives CKE pruning and
+        # replacement through the existing dead-queue flow.
+        if getattr(self, "llm_server_manager", None) is not None:
+
+            async def _ft_clear_kv_fault_callback(replica_id: str) -> None:
+                sup = self._ft_supervisor
+                if sup is None or not sup.is_running:
+                    raise RuntimeError(f"[FT] clear_kv_cache fault on replica {replica_id}: Supervisor is not running")
+                await asyncio.wait_for(
+                    self.llm_server_manager.global_load_balancer.remove_servers.remote([replica_id]),
+                    timeout=10.0,
+                )
+                sup.report_failure(replica_id, "clear_kv_cache")
+
+            self.llm_server_manager._ft_clear_kv_fault_callback = _ft_clear_kv_fault_callback
+
         logging.getLogger(__name__).warning(
             "[FT] init_workers: ThreadedSupervisor created with %d replicas, interval=%s miss_threshold=%s",
             len(replica_map),
