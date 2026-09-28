@@ -67,6 +67,7 @@ from verl.experimental.one_step_off_policy.ray_trainer import OneStepOffRayTrain
 from verl.experimental.reward_loop.reward_loop import RewardLoopManager
 from verl.experimental.separation.ray_trainer import SeparateRayPPOTrainer
 from verl.protocol import DataProto
+from verl.single_controller.ray.base import RayResourcePool
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.ray_utils import auto_await
 from verl.utils.rollout_trace import RolloutTraceConfig
@@ -1209,15 +1210,19 @@ def _async_main_initialize_components(self, config) -> None:
 
 
 # ---------------------------------------------------------------------------
-# placement — keep CPU-side actors off the inference-only nodes
+# placement — keep CPU-side actors and standalone rollout replicas apart
 # ---------------------------------------------------------------------------
-# Inference replicas (vLLM/NPU pods) are rescheduled by Kubernetes on fault;
-# any CPU actor colocated with them dies with the pod and breaks the async
-# generation pipeline. Deployment contract: training pods start with
-# ``ray start --labels='{"verl.io/role": "trainer"}'`` and inference pods
-# never carry that label, so a strict node-label constraint keeps every
-# CPU-side actor on training hardware without depending on transient ids.
-# The head pod runs no business workloads.
+# Deployment contract: nodes carry a role label set at ray start time
+# (`ray start --labels='{"verl.io/role": "<role>"}'`): trainer nodes run the
+# training + CPU coordination actors, rollout nodes run standalone rollout
+# replicas, and the head runs no business workload (it carries the head label
+# only, so both hard constraints below exclude it).
+# - CPU-side coordination actors use a strict trainer-label constraint.
+# - Standalone rollout placement groups (CKE workers + the vLLM HTTP servers
+#   that follow them) use a strict rollout-label constraint; native
+#   scheduling would otherwise let them land on trainer nodes.
+# Hybrid (colocated) rollout keeps native scheduling: it shares the trainer
+# pool by design.
 
 
 def _ft_placement_enabled(config) -> bool:
@@ -1229,23 +1234,48 @@ def _ft_placement_enabled(config) -> bool:
     return OmegaConf.select(config, "async_training.fault_tolerance.placement.enabled", default=True)
 
 
+_ft_label_cfg = None
+
+
+def _ft_cache_label_config(config) -> None:
+    """Cache the role-label config for call sites that have no config (PGs)."""
+    global _ft_label_cfg
+    if config is None or not _ft_placement_enabled(config):
+        return
+    _ft_label_cfg = {
+        "key": OmegaConf.select(
+            config, "async_training.fault_tolerance.placement.node_label_key", default="verl.io/role"
+        )
+        or "",
+        "trainer": OmegaConf.select(
+            config, "async_training.fault_tolerance.placement.trainer_label_value", default="trainer"
+        )
+        or "",
+        "rollout": OmegaConf.select(
+            config, "async_training.fault_tolerance.placement.rollout_label_value", default="rollout"
+        )
+        or "",
+    }
+
+
 def _ft_non_inference_scheduling_strategy(config, label: str):
-    """Strict node-label strategy constraining an actor to training nodes.
+    """Strict node-label strategy constraining an actor to trainer nodes.
 
     Returns ``None`` when placement is disabled, the label key/value is empty
     (disables the constraint), or the Ray runtime cannot express node-label
     constraints (Ray < 2.36; verl requires >= 2.41 so this is defensive only).
     """
+    _ft_cache_label_config(config)
     if not _ft_placement_enabled(config):
         return None
     key = OmegaConf.select(
         config,
-        "async_training.fault_tolerance.placement.non_inference_node_label_key",
+        "async_training.fault_tolerance.placement.node_label_key",
         default="verl.io/role",
     )
     value = OmegaConf.select(
         config,
-        "async_training.fault_tolerance.placement.non_inference_node_label_value",
+        "async_training.fault_tolerance.placement.trainer_label_value",
         default="trainer",
     )
     if not key or not value:
@@ -1263,7 +1293,7 @@ def _ft_non_inference_scheduling_strategy(config, label: str):
             if not labelled:
                 logger.warning(
                     "[placement] no alive node carries label %s=%s yet; %s will stay pending "
-                    "until a training pod joins with 'ray start --labels'",
+                    "until a trainer node joins with 'ray start --labels'",
                     key,
                     value,
                     label,
@@ -1272,6 +1302,81 @@ def _ft_non_inference_scheduling_strategy(config, label: str):
             pass
     logger.info("[placement] schedule %s on nodes labelled %s=%s (strict)", label, key, value)
     return NodeLabelSchedulingStrategy(hard={key: In(value)})
+
+
+def _ft_rollout_pg_label_selector(name_prefix: str):
+    """Per-bundle label selector pinning a placement group to rollout nodes.
+
+    Applies only to standalone-rollout pools (names starting with
+    ``rollout``). Returns ``None`` for other pools, when placement is off, or
+    when the rollout label value is empty (disables the constraint).
+    """
+    if not name_prefix.startswith("rollout"):
+        return None
+    cfg = globals().get("_ft_label_cfg")  # globals().get: also safe under partial-module exec (tests)
+    if not cfg:
+        # run_ppo never ran with a config (custom entry point): stay native.
+        if not getattr(_ft_rollout_pg_label_selector, "_no_cfg_warned", False):
+            _ft_rollout_pg_label_selector._no_cfg_warned = True
+            logger.warning("[placement] no label config cached; rollout placement groups use native scheduling")
+        return None
+    key, value = cfg["key"], cfg["rollout"]
+    if not key or not value:
+        return None
+    logger.info("[placement] schedule rollout pool %s on nodes labelled %s=%s (strict)", name_prefix, key, value)
+    return {key: value}
+
+
+def _ft_rollout_get_placement_groups(self, selector, strategy="STRICT_PACK", name=None, device_name="cuda"):
+    """Native ``RayResourcePool.get_placement_groups`` plus a label selector.
+
+    Mirrors verl's implementation verbatim; the only addition is
+    ``bundle_label_selector`` so every bundle lands on a rollout-labelled
+    node (Ray >= 2.36; older Ray ignores nothing — it rejects the kwarg, but
+    verl requires >= 2.41 so this is safe).
+    """
+    from ray.util.placement_group import placement_group
+
+    from verl.single_controller.ray.base import sort_placement_group_by_node_ip
+
+    if self.pgs is not None:
+        return self.pgs
+    pg_name_prefix = (
+        name if name else f"{self.name_prefix}verl_group_{'_'.join([str(count) for count in self._store])}:"
+    )
+    if device_name == "npu":
+        device_name = "NPU"
+    elif device_name == "cuda":
+        device_name = "GPU"
+    bundle = {"CPU": self.max_colocate_count}
+    if self.use_gpu:
+        bundle[device_name] = 1
+        if self.accelerator_type is not None:
+            bundle[self.accelerator_type] = 1e-4
+    pg_scheme = [[bundle.copy() for _ in range(process_count)] for process_count in self._store]
+    lifetime = "detached" if self.detached else None
+    pgs = [
+        placement_group(
+            bundles=bundles,
+            strategy=strategy,
+            name=pg_name_prefix + str(idx),
+            lifetime=lifetime,
+            bundle_label_selector=[dict(selector) for _ in bundles],
+        )
+        for idx, bundles in enumerate(pg_scheme)
+    ]
+    ray.get([pg.ready() for pg in pgs])
+    self.pgs = sort_placement_group_by_node_ip(pgs)
+    return pgs
+
+
+@wrap(RayResourcePool, "get_placement_groups")
+def _ft_resource_pool_get_placement_groups(orig, self, *args, **kwargs):
+    """Create standalone-rollout placement groups on rollout-labelled nodes."""
+    selector = _ft_rollout_pg_label_selector(self.name_prefix)
+    if selector is None:
+        return orig(self, *args, **kwargs)
+    return _ft_rollout_get_placement_groups(self, selector, *args, **kwargs)
 
 
 class _FtNonInferenceRemote:
@@ -1377,6 +1482,7 @@ class _FtTaskRunnerRemote:
 
 @patch_module_function(verl.trainer.main_ppo, "run_ppo")
 def _run_ppo(config, task_runner_class=None):
+    _ft_cache_label_config(config)
     if task_runner_class is None:
         # Mirror native main()'s default: the V1 runner (already a Ray actor class).
         task_runner_class = getattr(verl.trainer.main_ppo, "TaskRunnerV1", None)

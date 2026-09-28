@@ -118,16 +118,26 @@ async_training:
     heartbeat_interval_s: 5.0
     heartbeat_miss_threshold: 3
     max_weight_sync_retries: 2
-    # CPU-side coordination actors (task runner, rollouter, trainer, message
-    # queue, agent/reward loop workers, LB, progress store) are strictly
-    # constrained to pods carrying the training label below — they can never
-    # be scheduled onto inference pods. Set the label on training pods at
-    # ray start time: `ray start --labels='{"verl.io/role": "trainer"}'`.
+    # Node-label based scheduling isolation (strict, whitelist-style). Give
+    # every node a role label at ray start time
+    # (`ray start --labels='{"verl.io/role": "<role>"}'`):
+    #   head nodes:    "head"    — run no business workload; excluded by both
+    #                              constraints below because they carry neither
+    #                              the trainer nor the rollout label.
+    #   trainer nodes: "trainer" — training + all CPU-side coordination actors
+    #                              (task runner, rollouter, trainer, message
+    #                              queue, agent/reward loop workers, LB,
+    #                              progress store).
+    #   rollout nodes: "rollout" — standalone rollout replicas (CKE workers and
+    #                              the vLLM HTTP servers that follow them).
+    # Hybrid (colocated) rollout keeps native scheduling: it shares the
+    # trainer pool by design.
     placement:
       enabled: True
-      non_inference_node_label_key: "verl.io/role"
-      # empty key/value disables the label constraint
-      non_inference_node_label_value: "trainer"
+      node_label_key: "verl.io/role"
+      # empty value disables the corresponding constraint
+      trainer_label_value: "trainer"
+      rollout_label_value: "rollout"
 actor_rollout_ref:
   rollout:
     # standalone async rollout
