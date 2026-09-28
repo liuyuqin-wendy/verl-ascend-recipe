@@ -100,7 +100,7 @@ def _build_patched_actors(ray):
             finalizing = True
         if finalizing:
             nodes.append(node)
-        elif isinstance(node, ast.ClassDef) and node.name == "_FtNodeAffinityRemote":
+        elif isinstance(node, ast.ClassDef) and node.name == "_FtNonInferenceRemote":
             nodes.append(node)
         elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and (
             node.name == "_sep_trainer_init"
@@ -123,7 +123,17 @@ class FullyAsyncRayPatchTests(unittest.TestCase):
         cls.ray = ray
         cls.started_here = not ray.is_initialized()
         if cls.started_here:
-            ray.init(num_cpus=1, include_dashboard=False, log_to_driver=False)
+            # Label the local node so the strict non-inference placement
+            # constraint has a matching target when fault tolerance is on.
+            try:
+                ray.init(
+                    num_cpus=1,
+                    include_dashboard=False,
+                    log_to_driver=False,
+                    labels={"verl.io/role": "trainer"},
+                )
+            except TypeError:  # older Ray without the labels kwarg
+                ray.init(num_cpus=1, include_dashboard=False, log_to_driver=False)
         try:
             cls.patched, cls.original = _build_patched_actors(ray)
         except Exception:

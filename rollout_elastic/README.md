@@ -118,6 +118,16 @@ async_training:
     heartbeat_interval_s: 5.0
     heartbeat_miss_threshold: 3
     max_weight_sync_retries: 2
+    # CPU-side coordination actors (task runner, rollouter, trainer, message
+    # queue, agent/reward loop workers, LB, progress store) are strictly
+    # constrained to pods carrying the training label below — they can never
+    # be scheduled onto inference pods. Set the label on training pods at
+    # ray start time: `ray start --labels='{"verl.io/role": "trainer"}'`.
+    placement:
+      enabled: True
+      non_inference_node_label_key: "verl.io/role"
+      # empty key/value disables the label constraint
+      non_inference_node_label_value: "trainer"
 actor_rollout_ref:
   rollout:
     # standalone async rollout

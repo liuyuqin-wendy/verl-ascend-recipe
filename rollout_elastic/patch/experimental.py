@@ -44,6 +44,7 @@ from pprint import pprint
 import ray
 from omegaconf import OmegaConf
 
+import verl.trainer.main_ppo
 from verl.checkpoint_engine import CheckpointEngineManager
 from verl.experimental.agent_loop.agent_loop import (
     AgentLoopManager,
@@ -73,7 +74,7 @@ from verl.utils.tracking import Tracking
 from verl.workers.rollout.fault_tolerance import filter_partial_batch
 from verl.workers.rollout.llm_server import LLMServerManager
 
-from ._core import add, patch, unwrap_ray_remote, wrap
+from ._core import add, patch, patch_module_function, unwrap_ray_remote, wrap
 
 logger = logging.getLogger(__name__)
 
@@ -262,7 +263,9 @@ def _sep_trainer_init_workers(self):
     self.checkpoint_manager = CheckpointEngineManager(
         config=omega_conf_to_dataclass(self.config.actor_rollout_ref.rollout.checkpoint_engine),
         trainer=self.actor_rollout_wg,
-        replicas=self.llm_server_manager.get_replicas(),
+        # Copy: get_replicas() returns the manager's live rollout_replicas list;
+        # CKE would prune it in place on replica death, breaking spawn_replacement.
+        replicas=list(self.llm_server_manager.get_replicas()),
         fault_tolerance=ft_cfg,
         load_balancer_handle=self.llm_server_manager.global_load_balancer,
     )
@@ -1177,7 +1180,7 @@ def _async_main_initialize_components(self, config) -> None:
     # max_queue_size
     max_queue_size = ray.get(self.components["rollouter"].get_max_queue_size.remote())
     print(f"[ASYNC MAIN] Creating MessageQueue... max_queue_size {max_queue_size}")
-    message_queue = _FtNodeAffinityRemote(MessageQueue, "message_queue").remote(config, max_queue_size)
+    message_queue = _FtNonInferenceRemote(MessageQueue, "message_queue").remote(config, max_queue_size)
     message_queue_client = MessageQueueClient(message_queue)
     self.components["message_queue"] = message_queue
     self.components["message_queue_client"] = message_queue_client
@@ -1209,12 +1212,12 @@ def _async_main_initialize_components(self, config) -> None:
 # placement — keep CPU-side actors off the inference-only nodes
 # ---------------------------------------------------------------------------
 # Inference replicas (vLLM/NPU pods) are rescheduled by Kubernetes on fault;
-# any CPU actor colocated with them dies with the pod and breaks the
-# fully-async generation pipeline. Every CPU-side actor therefore gets a soft
-# node affinity to the nodes hosting the ``trainer_pool`` placement groups
-# (deterministic verl naming: ``<pool_name>verl_group_<...>:`` from
-# ``RayResourcePool.get_placement_groups``). Soft affinity keeps the native
-# fallback semantics when a training node runs out of CPUs.
+# any CPU actor colocated with them dies with the pod and breaks the async
+# generation pipeline. Deployment contract: training pods start with
+# ``ray start --labels='{"verl.io/role": "trainer"}'`` and inference pods
+# never carry that label, so a strict node-label constraint keeps every
+# CPU-side actor on training hardware without depending on transient ids.
+# The head pod runs no business workloads.
 
 
 def _ft_placement_enabled(config) -> bool:
@@ -1226,95 +1229,87 @@ def _ft_placement_enabled(config) -> bool:
     return OmegaConf.select(config, "async_training.fault_tolerance.placement.enabled", default=True)
 
 
-def _ft_training_node_ids() -> list[str]:
-    """Node ids hosting the ``trainer_pool`` / ``teacher_pool`` placement groups."""
-    node_ids: list[str] = []
-    try:
-        table = ray.util.placement_group_table()
-    except Exception:  # pragma: no cover - defensive: no cluster metadata yet
-        return node_ids
-    for entry in table.values():
-        name = entry.get("name") or ""
-        if not name.startswith(("trainer_poolverl_group_", "teacher_poolverl_group_")):
-            continue
-        # verl requires ray>=2.41 where placement_group_table() exposes the
-        # singular "bundles_to_node_id" key.
-        bundles = entry.get("bundles_to_node_id") or {}
-        for node_id in bundles.values():
-            if node_id and node_id not in node_ids:
-                node_ids.append(node_id)
-    node_ids.sort()
-    return node_ids
+def _ft_non_inference_scheduling_strategy(config, label: str):
+    """Strict node-label strategy constraining an actor to training nodes.
 
-
-def _ft_training_node_ids_or_warn(config, label: str) -> list[str]:
-    """Training-node ids when placement applies; warn instead of failing silently."""
+    Returns ``None`` when placement is disabled, the label key/value is empty
+    (disables the constraint), or the Ray runtime cannot express node-label
+    constraints (Ray < 2.36; verl requires >= 2.41 so this is defensive only).
+    """
     if not _ft_placement_enabled(config):
-        return []
-    node_ids = _ft_training_node_ids()
-    if not node_ids:
+        return None
+    key = OmegaConf.select(
+        config,
+        "async_training.fault_tolerance.placement.non_inference_node_label_key",
+        default="verl.io/role",
+    )
+    value = OmegaConf.select(
+        config,
+        "async_training.fault_tolerance.placement.non_inference_node_label_value",
+        default="trainer",
+    )
+    if not key or not value:
+        return None
+    try:
+        from ray.util.scheduling_strategies import In, NodeLabelSchedulingStrategy
+    except Exception:  # pragma: no cover - defensive: Ray without node labels
+        return None
+    # A hard label constraint silently parks the actor when no node matches;
+    # warn once instead of leaving an unexplained PENDING actor.
+    if not getattr(_ft_non_inference_scheduling_strategy, "_label_warned", False):
+        _ft_non_inference_scheduling_strategy._label_warned = True
         try:
-            known = sorted({entry.get("name") or "?" for entry in ray.util.placement_group_table().values()})
-        except Exception:
-            known = []
-        logger.warning(
-            "[placement] fault tolerance is enabled but no trainer_pool placement groups "
-            "found yet (known PGs: %s); %s will fall back to native scheduling and may land on inference nodes",
-            known or "none",
-            label,
-        )
-    return node_ids
+            labelled = any(node.get("Alive") and (node.get("Labels") or {}).get(key) == value for node in ray.nodes())
+            if not labelled:
+                logger.warning(
+                    "[placement] no alive node carries label %s=%s yet; %s will stay pending "
+                    "until a training pod joins with 'ray start --labels'",
+                    key,
+                    value,
+                    label,
+                )
+        except Exception:  # pragma: no cover - defensive: no cluster metadata yet
+            pass
+    logger.info("[placement] schedule %s on nodes labelled %s=%s (strict)", label, key, value)
+    return NodeLabelSchedulingStrategy(hard={key: In(value)})
 
 
-class _FtNodeAffinityRemote:
-    """Proxy exposing ``.remote()`` that pins the actor to a training node.
+class _FtNonInferenceRemote:
+    """Proxy exposing ``.remote()`` that keeps an actor off inference nodes.
 
-    Falls through to native scheduling when placement is disabled or no
-    ``trainer_pool`` placement group exists yet (e.g. the trainer actor
-    itself, which is created before its own resource pools — documented
-    limitation: that coordinator may still land on an inference node unless
-    the deployment pre-creates the trainer pools).
+    Applies ``_ft_non_inference_scheduling_strategy`` when the caller passes a
+    config (positionally or as the ``config`` kwarg); otherwise falls through
+    to native scheduling.
     """
 
     def __init__(self, actor_cls, label: str):
         self._actor_cls = actor_cls
         self._label = label
-        self._index = 0
 
     def remote(self, *args, **kwargs):
         config = kwargs.get("config")
         if config is None and args:
             config = args[0]
-        node_ids = _ft_training_node_ids_or_warn(config, f"the {self._label} actor")
-        if not node_ids:
+        strategy = _ft_non_inference_scheduling_strategy(config, self._label)
+        if strategy is None:
             return self._actor_cls.remote(*args, **kwargs)
-        node_id = node_ids[self._index % len(node_ids)]
-        self._index += 1
-        logger.info("[placement] pin %s to training node %s (soft)", self._label, node_id)
-        return self._actor_cls.options(
-            scheduling_strategy=ray.util.scheduling_strategies.NodeAffinitySchedulingStrategy(
-                node_id=node_id, soft=True
-            )
-        ).remote(*args, **kwargs)
+        return self._actor_cls.options(scheduling_strategy=strategy).remote(*args, **kwargs)
 
 
 @wrap(AgentLoopManager, "_init_agent_loop_workers")
 async def _agent_manager_init_workers(orig, self, *args, **kwargs):
-    """Round-robin agent loop workers over training nodes only."""
-    node_ids = _ft_training_node_ids_or_warn(self.config, "agent loop workers")
-    if not node_ids:
+    """Create agent loop workers under the non-inference label constraint."""
+    strategy = _ft_non_inference_scheduling_strategy(self.config, "agent loop workers")
+    if strategy is None:
         return await orig(self, *args, **kwargs)
 
     self.agent_loop_workers = []
     num_workers = self.rollout_config.agent.num_workers
     for i in range(num_workers):
-        node_id = node_ids[i % len(node_ids)]
         self.agent_loop_workers.append(
             self.agent_loop_workers_class.options(
                 name=f"agent_loop_worker_{i}" + f"_{uuid.uuid4().hex[:8]}",
-                scheduling_strategy=ray.util.scheduling_strategies.NodeAffinitySchedulingStrategy(
-                    node_id=node_id, soft=True
-                ),
+                scheduling_strategy=strategy,
             ).remote(
                 self.config,
                 self.llm_client,
@@ -1322,30 +1317,77 @@ async def _agent_manager_init_workers(orig, self, *args, **kwargs):
                 self.reward_loop_worker_handles,
             )
         )
-    logger.info("[placement] placed %d agent loop workers on training nodes %s", num_workers, node_ids)
+    logger.info("[placement] placed %d agent loop workers under the non-inference label constraint", num_workers)
 
 
 @wrap(RewardLoopManager, "_init_reward_loop_workers")
 def _reward_manager_init_workers(orig, self, *args, **kwargs):
-    """Round-robin reward loop workers over training nodes only."""
-    node_ids = _ft_training_node_ids_or_warn(self.config, "reward loop workers")
-    if not node_ids:
+    """Create reward loop workers under the non-inference label constraint."""
+    strategy = _ft_non_inference_scheduling_strategy(self.config, "reward loop workers")
+    if strategy is None:
         return orig(self, *args, **kwargs)
 
     self.reward_loop_workers = []
     num_workers = self.config.reward.num_workers
     for i in range(num_workers):
-        node_id = node_ids[i % len(node_ids)]
         self.reward_loop_workers.append(
             self.reward_loop_workers_class.options(
                 name=f"reward_loop_worker_{i}",
-                scheduling_strategy=ray.util.scheduling_strategies.NodeAffinitySchedulingStrategy(
-                    node_id=node_id,
-                    soft=True,
-                ),
+                scheduling_strategy=strategy,
             ).remote(self.config, self.reward_router_address)
         )
-    logger.info("[placement] placed %d reward loop workers on training nodes %s", num_workers, node_ids)
+    logger.info("[placement] placed %d reward loop workers under the non-inference label constraint", num_workers)
+
+
+# ---------------------------------------------------------------------------
+# one-step-off / legacy / fully-async entries: keep the TaskRunner off
+# inference nodes
+# ---------------------------------------------------------------------------
+# Native scheduling would let the runner actor float onto a CPU-rich
+# inference pod that Kubernetes deletes on fault, so wrap the runner class
+# with the strict label constraint. It must stay a real Ray actor: running it
+# in the driver would import the NPU-dependent worker classes in the
+# (NPU-less) driver process.
+
+
+class _FtTaskRunnerRemote:
+    """Proxy exposing ``.remote()`` / ``.options()`` that keeps the task runner
+    off inference nodes (see ``_ft_non_inference_scheduling_strategy``).
+
+    The constraint is strict, so the actor stays pending instead of floating
+    onto an inference pod. ``run_ppo`` only touches ``.remote()`` (plus
+    ``.options(...)`` for the nsys runtime env) before blocking on
+    ``ray.get(runner.run.remote(config))``.
+    """
+
+    def __init__(self, actor_cls, config, label: str):
+        self._actor_cls = actor_cls
+        self._config = config
+        self._label = label
+
+    def options(self, **options):
+        strategy = _ft_non_inference_scheduling_strategy(self._config, self._label)
+        if strategy is not None:
+            options["scheduling_strategy"] = strategy
+        return self._actor_cls.options(**options)
+
+    def remote(self, *args, **kwargs):
+        return self.options().remote(*args, **kwargs)
+
+
+@patch_module_function(verl.trainer.main_ppo, "run_ppo")
+def _run_ppo(config, task_runner_class=None):
+    if task_runner_class is None:
+        # Mirror native main()'s default: the V1 runner (already a Ray actor class).
+        task_runner_class = getattr(verl.trainer.main_ppo, "TaskRunnerV1", None)
+    if (
+        task_runner_class is not None
+        and not isinstance(task_runner_class, (_FtNonInferenceRemote, _FtTaskRunnerRemote))
+        and _ft_placement_enabled(config)
+    ):
+        logger.info("[placement] FT placement: pin the task runner away from inference nodes")
+        task_runner_class = _FtTaskRunnerRemote(task_runner_class, config, "the task runner")
+    return verl.trainer.main_ppo._orig_run_ppo(config, task_runner_class)
 
 
 # Refresh Ray's wrappers and method tables only after all decorators complete.
@@ -1360,9 +1402,7 @@ fully_async_main.FullyAsyncTrainer = FullyAsyncTrainer
 FullyAsyncTaskRunner = ray.remote(num_cpus=1)(unwrap_ray_remote(FullyAsyncTaskRunner))
 fully_async_main.FullyAsyncTaskRunner = FullyAsyncTaskRunner
 
-# Placement: pin the top-level CPU coordinators to training nodes. The trainer
-# actor is created before its own resource pools exist, so its candidate set is
-# empty at that point and the wrapper falls through to native scheduling
-# (documented limitation, see _FtNodeAffinityRemote).
-fully_async_main.FullyAsyncRollouter = _FtNodeAffinityRemote(FullyAsyncRollouter, "fully_async_rollouter")
-fully_async_main.FullyAsyncTrainer = _FtNodeAffinityRemote(FullyAsyncTrainer, "fully_async_trainer")
+# Placement: keep the top-level CPU coordinators off inference nodes (see
+# _FtNonInferenceRemote).
+fully_async_main.FullyAsyncRollouter = _FtNonInferenceRemote(FullyAsyncRollouter, "fully_async_rollouter")
+fully_async_main.FullyAsyncTrainer = _FtNonInferenceRemote(FullyAsyncTrainer, "fully_async_trainer")
