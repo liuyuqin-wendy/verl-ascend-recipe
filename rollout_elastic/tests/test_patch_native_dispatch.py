@@ -148,7 +148,7 @@ class TestNativeDispatch(unittest.TestCase):
 
         namespace = dict(
             LLMServerClient=BaseClient,
-            FullyLLMServerClient=FullyClient,
+            FullyAsyncLLMServerClient=FullyClient,
             functools=functools,
             patch=core.patch,
             rollout_trace_op=trace,
