@@ -135,8 +135,17 @@ if ServerAdapter is not None:
 
     @patch(ServerAdapter, "update_weights")
     @torch.no_grad()
-    async def update_weights(self, weights, global_steps: int = None, **kwargs):
+    async def update_weights(
+        self,
+        weights,
+        global_steps: int = None,
+        wire_format: str = "named_tensors",
+        **kwargs,
+    ):
         """Update model weights via CUDA IPC (fallback to shared memory if IPC not supported) to inference workers."""
+        assert wire_format == "named_tensors", (
+            f"vLLM rollout only consumes full named tensors; got wire_format={wire_format!r}"
+        )
         start_time = time.time()
         attempt_id = kwargs.get("attempt_id")
         target_version = kwargs.get("target_version")
@@ -249,10 +258,10 @@ if vLLMHttpServer is not None:
         # Calculate the maximum possible new tokens based on available context space
         # This serves as a safety upper bound
         max_possible_tokens = self.config.max_model_len - len(prompt_ids)
-        if max_possible_tokens < 0:
+        if max_possible_tokens < 1:
             raise ValueError(
-                f"Prompt length ({len(prompt_ids)}) exceeds the model's maximum context length "
-                f"({self.config.max_model_len})."
+                f"Prompt length ({len(prompt_ids)}) leaves no generation token space under the model's "
+                f"maximum context length ({self.config.max_model_len})."
             )
 
         # Determine max_tokens from sampling_params or use configured response_length as default
@@ -269,10 +278,19 @@ if vLLMHttpServer is not None:
                 self.config.response_length, self.config.prompt_length + self.config.response_length - len(prompt_ids)
             )
 
-        # Clamp max_tokens to the valid range [0, max_possible_tokens]
-        max_tokens = max(0, min(max_tokens, max_possible_tokens))
+        # vLLM requires at least one generation token.  A zero budget is a
+        # continuation boundary and must be handled by the client before this
+        # server method is called; silently changing it to one would generate
+        # an extra token beyond the request budget.
+        try:
+            max_tokens = int(max_tokens)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"max_tokens must be a positive integer, got {max_tokens!r}") from exc
+        if max_tokens < 1:
+            raise ValueError(f"max_tokens must be at least 1, got {max_tokens}")
+        max_tokens = min(max_tokens, max_possible_tokens)
 
-        assert max_tokens <= max_possible_tokens, (
+        assert 1 <= max_tokens <= max_possible_tokens, (
             f"max_tokens {max_tokens} exceeds available context space {max_possible_tokens}"
         )
         sampling_params["logprobs"] = 0 if sampling_params.pop("logprobs", False) else None

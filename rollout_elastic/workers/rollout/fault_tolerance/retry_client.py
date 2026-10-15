@@ -189,7 +189,25 @@ class RetryLLMServerClient(LLMServerClient):
                     progress_ctx = ProgressContext(checkpoint=checkpoint)
                     prefix_for_call = checkpoint.resume_prefix_token_ids()
                     call_sampling = copy.deepcopy(original_sampling)
-                    call_sampling[self._generation_budget_key()] = checkpoint.remaining_max_tokens()
+                    remaining_max_tokens = checkpoint.remaining_max_tokens()
+                    if remaining_max_tokens <= 0:
+                        # The persisted continuation already consumed the
+                        # complete request budget.  Do not call the server
+                        # with zero and let a lower layer synthesize one more
+                        # token.
+                        return TokenOutput(
+                            token_ids=list(checkpoint.cumulative_token_ids),
+                            log_probs=(
+                                list(checkpoint.cumulative_log_probs)
+                                if checkpoint.cumulative_log_probs is not None
+                                else []
+                            ),
+                            routed_experts=checkpoint.cumulative_routed_experts,
+                            num_preempted=checkpoint.num_preempted,
+                            stop_reason="length",
+                            extra_fields={"global_steps": self._last_global_step},
+                        )
+                    call_sampling[self._generation_budget_key()] = remaining_max_tokens
                     if result.inherited_prefix_len > 0:
                         logger.warning(
                             "[FT] token continuation from checkpoint: resuming with %d inherited tokens "

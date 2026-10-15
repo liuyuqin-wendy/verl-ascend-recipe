@@ -60,6 +60,7 @@ from verl.experimental.fully_async_policy.detach_utils import safe_create_task
 from verl.experimental.fully_async_policy.fully_async_main import FullyAsyncTaskRunner
 from verl.experimental.fully_async_policy.fully_async_rollouter import (
     FullyAsyncAgentLoopManager,
+    FullyAsyncLLMServerManager,
     FullyAsyncRollouter,
 )
 from verl.experimental.fully_async_policy.fully_async_trainer import FullyAsyncTrainer
@@ -272,7 +273,7 @@ def _sep_trainer_init_workers(self):
 
     self.checkpoint_manager = CheckpointEngineManager(
         config=omega_conf_to_dataclass(self.config.actor_rollout_ref.rollout.checkpoint_engine),
-        trainer=self.actor_rollout_wg,
+        actor_wg=self.actor_rollout_wg,
         # Copy: get_replicas() returns the manager's live rollout_replicas list;
         # CKE would prune it in place on replica death, breaking spawn_replacement.
         replicas=list(self.llm_server_manager.get_replicas()),
@@ -342,27 +343,6 @@ def _sep_trainer_init_workers(self):
         self.checkpoint_manager.set_sync_failure_reporter(self._ft_supervisor.report_failure)
         self.checkpoint_manager.set_replica_promotion_reporter(self._ft_supervisor.promote_replica)
 
-        # one-step control-plane faults: LLMServerManager.clear_kv_cache hands
-        # transient rollout faults here instead of failing the weight-sync step
-        # (the Manager keeps dead replicas listed for spawn_replacement). Fixed
-        # order — the Supervisor must be running (report_failure silently no-ops
-        # otherwise), LB isolation first so new acquires stop routing to the
-        # dead replica, then the idempotent report that drives CKE pruning and
-        # replacement through the existing dead-queue flow.
-        if getattr(self, "llm_server_manager", None) is not None:
-
-            async def _ft_clear_kv_fault_callback(replica_id: str) -> None:
-                sup = self._ft_supervisor
-                if sup is None or not sup.is_running:
-                    raise RuntimeError(f"[FT] clear_kv_cache fault on replica {replica_id}: Supervisor is not running")
-                await asyncio.wait_for(
-                    self.llm_server_manager.global_load_balancer.remove_servers.remote([replica_id]),
-                    timeout=10.0,
-                )
-                sup.report_failure(replica_id, "clear_kv_cache")
-
-            self.llm_server_manager._ft_clear_kv_fault_callback = _ft_clear_kv_fault_callback
-
         logging.getLogger(__name__).warning(
             "[FT] init_workers: ThreadedSupervisor created with %d replicas, interval=%s miss_threshold=%s",
             len(replica_map),
@@ -400,6 +380,9 @@ def _one_step_init_async_rollout_manager(self):
     self.llm_server_manager = LLMServerManager.create(config=self.config)
     self._init_one_step_progress()
     self.async_rollout_mode = True
+    # Retrying client: request unavailability is surfaced as bounded retries
+    # instead of failing the generation call; native client when FT is off.
+
     self.async_rollout_manager = AgentLoopManager.create(
         config=self.config,
         llm_client=self.llm_server_manager.get_client(client_cls=RetryLLMServerClient),
@@ -428,7 +411,8 @@ async def _one_step_init_progress(self) -> None:
 
     await self.llm_server_manager._init_progress_store(progress_config)
     _ft_logging.getLogger(__name__).info(
-        "[FT] one-step token continuation enabled: run_id=%s, store=%s(client resolved via get_client(client_cls=RetryLLMServerClient))",
+        "[FT] one-step token continuation enabled: run_id=%s, store=%s"
+        "(client resolved via get_client(client_cls=RetryLLMServerClient))",
         self.llm_server_manager.run_id,
         progress_config.persist_root,
     )
@@ -521,8 +505,6 @@ async def _one_step_fit(self):
     """The training loop of PPO (FT-aware Supervisor lifecycle)."""
     from tqdm import tqdm
 
-    from verl.utils.rollout_skip import RolloutSkip
-
     self.logger = Tracking(
         project_name=self.config.trainer.project_name,
         experiment_name=self.config.trainer.experiment_name,
@@ -561,10 +543,6 @@ async def _one_step_fit(self):
         self.logger.log(data=val_metrics, step=self.global_steps)
         if self.config.trainer.get("val_only", False):
             return
-
-    if self.config.actor_rollout_ref.rollout.get("skip_rollout", False):
-        rollout_skip = RolloutSkip(self.config, self.actor_rollout_wg)
-        rollout_skip.wrap_generate_sequences()
 
     # add tqdm
     self.progress_bar = tqdm(total=self.total_training_steps, initial=self.global_steps, desc="Training Progress")
@@ -858,7 +836,13 @@ async def _rollouter_init_async_rollout_manager(self):
     assert self.config.actor_rollout_ref.rollout.mode == "async"
 
     self.async_rollout_mode = True
-    self.llm_server_manager = await LLMServerManager.create(config=self.config)
+    # Dedicated manager tracks standalone and hybrid replicas and exposes the
+    # active replica count used for capacity planning. Standalone mode passes
+    # no hybrid worker group, so only standalone replicas are tracked.
+    self.llm_server_manager = await FullyAsyncLLMServerManager.create(
+        config=self.config,
+        worker_group=self.get_hybrid_worker_group(),
+    )
     await self._init_fully_async_progress()
     self.async_rollout_manager = await FullyAsyncAgentLoopManager.create(
         config=self.config,
@@ -984,12 +968,13 @@ async def _rollouter_fit(self):
 # fully_async_policy.fully_async_trainer — FullyAsyncTrainer
 # ---------------------------------------------------------------------------
 @patch(FullyAsyncTrainer, "_setup_checkpoint_manager")
-def _async_trainer_setup_checkpoint_manager(self, rollouter):
+async def _async_trainer_setup_checkpoint_manager(self):
     """Setup checkpoint manager after rollouter is initialized (FT-aware)."""
     if not OmegaConf.select(self.config, "async_training.fault_tolerance.enabled", default=False):
-        return self._orig__setup_checkpoint_manager(rollouter)
+        return await self._orig__setup_checkpoint_manager()
 
-    replicas = ray.get(rollouter.get_replicas.remote())
+    rollouter = self.rollouter
+    replicas = await rollouter.get_replicas.remote()
     checkpoint_engine_config = omega_conf_to_dataclass(self.config.actor_rollout_ref.rollout.checkpoint_engine)
 
     # FT: read fault_tolerance config + fetch LB handle from rollouter
@@ -997,13 +982,13 @@ def _async_trainer_setup_checkpoint_manager(self, rollouter):
 
     lb_handle = None
     try:
-        lb_handle = ray.get(rollouter.get_load_balancer.remote())
+        lb_handle = await rollouter.get_load_balancer.remote()
     except Exception:
         lb_handle = None
 
     self.checkpoint_manager = CheckpointEngineManager(
         config=checkpoint_engine_config,
-        trainer=self.actor_wg,
+        actor_wg=self.actor_wg,
         replicas=replicas,
         fault_tolerance=ft_cfg,
         load_balancer_handle=lb_handle,
