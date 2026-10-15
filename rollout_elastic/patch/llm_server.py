@@ -23,7 +23,7 @@ This area replaces the LB actor and extends the native client/manager classes:
 - ``LLMServerClient``: accepts ``run_id`` / ``progress_store`` / ``max_model_len``,
   and gains the single-attempt primitive ``_generate_once`` with transient-fault
   translation (``ServerUnavailable``) and ``_mark_server_failed``.
-- ``FullyLLMServerClient``: its ``generate`` loop becomes fault-tolerant
+- ``FullyAsyncLLMServerClient``: its ``generate`` loop becomes fault-tolerant
   (retry on a fresh server) and token-continuation aware (mode C).
 - ``LLMServerManager``: tracks a process-level ``run_id``, can assemble the
   ``RolloutProgressStoreActor``, and can spawn replacement replicas
@@ -53,7 +53,7 @@ from verl.utils.rollout_trace import rollout_trace_op
 from verl.utils.tokenizer import normalize_token_ids
 from verl.workers.rollout.llm_server import (
     DEFAULT_ROUTING_CACHE_SIZE,
-    FullyLLMServerClient,
+    FullyAsyncLLMServerClient,
     LLMServerClient,
     LLMServerManager,
 )
@@ -151,14 +151,22 @@ def _client_init(
     orig,
     self,
     config: DictConfig,
-    servers: dict[str, ray.actor.ActorHandle],
-    load_balancer_handle: ray.actor.ActorHandle,
+    load_balancer_handle: ray.actor.ActorHandle = None,
+    servers: Optional[dict[str, ray.actor.ActorHandle]] = None,
     run_id: Optional[str] = None,
     progress_store: Optional[ray.actor.ActorHandle] = None,
     max_model_len: Optional[int] = None,
+    **kwargs: Any,
 ):
-    """LLMServerClient accepting the recipe's FT/progress kwargs."""
-    orig(self, config, servers, load_balancer_handle)
+    """LLMServerClient accepting the recipe's FT/progress kwargs.
+
+    Native v0.9.0 ``__init__(config, load_balancer_handle=None, **kwargs)`` only
+    stores config and the LB handle; the recipe pops its FT/progress context
+    out of ``kwargs`` and owns the ``_server_id_to_handle`` registry itself
+    (native clients no longer keep one).
+    """
+    orig(self, config, load_balancer_handle=load_balancer_handle, **kwargs)
+    self._server_id_to_handle: dict[str, ray.actor.ActorHandle] = dict(servers) if servers else {}
     self._run_id = run_id
     self._progress_store = progress_store
     self.max_model_len = max_model_len
@@ -228,20 +236,42 @@ async def _call_server(
     server_id: str,
     server: ray.actor.ActorHandle,
     *,
+    request_id: str,
     prompt_ids: list[int],
     sampling_params: dict[str, Any],
-    image_data: Optional[list[Any]],
-    video_data: Optional[list[Any]],
-    kwargs: dict[str, Any],
-    call_timeout_s: Optional[float],
+    image_data: Optional[list[Any]] = None,
+    video_data: Optional[list[Any]] = None,
+    audio_data: Optional[list[Any]] = None,
+    mm_processor_kwargs: Optional[dict[str, Any]] = None,
+    kwargs: dict[str, Any] = None,
+    call_timeout_s: Optional[float] = None,
 ) -> TokenOutput:
-    """Issue a single ``server.generate.remote`` call, optionally bounded by a timeout."""
+    """Issue a single ``server.generate.remote`` call, optionally bounded by a timeout.
+
+    Applies the native v0.9.0 request-shaping rules before the RPC: audio only
+    when non-None, mm_processor_kwargs only when non-empty, priority only when
+    non-zero and the rollout backend is vLLM. ``request_id`` is normalized via
+    the native ``_vllm_request_id`` so ``full_determinism`` keeps stable vLLM ids.
+    """
+    kwargs = dict(kwargs) if kwargs else {}
+    multimodal_kwargs = {}
+    if audio_data is not None:
+        multimodal_kwargs["audio_data"] = audio_data
+    if mm_processor_kwargs:
+        multimodal_kwargs["mm_processor_kwargs"] = mm_processor_kwargs
+    # priority is only supported by vLLM rollout server.
+    priority = kwargs.pop("priority", 0)
+    priority_kwargs = (
+        {"priority": priority} if priority != 0 and self.config.actor_rollout_ref.rollout.name == "vllm" else {}
+    )
     call = server.generate.remote(
-        request_id=uuid4().hex,
+        request_id=self._vllm_request_id(request_id),
         prompt_ids=prompt_ids,
         sampling_params=sampling_params,
         image_data=image_data,
         video_data=video_data,
+        **multimodal_kwargs,
+        **priority_kwargs,
         **kwargs,
     )
     if call_timeout_s is not None:
@@ -256,11 +286,13 @@ async def _generate_once(
     *,
     prompt_ids: list[int],
     sampling_params: dict[str, Any],
-    image_data: Optional[list[Any]],
-    video_data: Optional[list[Any]],
-    kwargs: dict[str, Any],
-    call_timeout_s: Optional[float],
-    translate_fault: bool,
+    image_data: Optional[list[Any]] = None,
+    video_data: Optional[list[Any]] = None,
+    audio_data: Optional[list[Any]] = None,
+    mm_processor_kwargs: Optional[dict[str, Any]] = None,
+    kwargs: dict[str, Any] = None,
+    call_timeout_s: Optional[float] = None,
+    translate_fault: bool = False,
     progress_ctx: Optional[Any] = None,
 ) -> tuple[TokenOutput, str]:
     """Single acquire -> call -> release on one server.
@@ -283,14 +315,17 @@ async def _generate_once(
     try:
         try:
             if progress_ctx is not None:
-                kwargs = {**kwargs, "progress_ctx": progress_ctx}
+                kwargs = {**(kwargs or {}), "progress_ctx": progress_ctx}
             output = await self._call_server(
                 server_id,
                 server,
+                request_id=request_id,
                 prompt_ids=prompt_ids,
                 sampling_params=sampling_params,
                 image_data=image_data,
                 video_data=video_data,
+                audio_data=audio_data,
+                mm_processor_kwargs=mm_processor_kwargs,
                 kwargs=kwargs,
                 call_timeout_s=call_timeout_s,
             )
@@ -357,6 +392,8 @@ async def generate(
     sampling_params: dict[str, Any],
     image_data: Optional[list[Any]] = None,
     video_data: Optional[list[Any]] = None,
+    audio_data: Optional[list[Any]] = None,
+    mm_processor_kwargs: Optional[dict[str, Any]] = None,
     progress_ctx: Optional[Any] = None,
     **kwargs: Any,
 ) -> TokenOutput:
@@ -384,21 +421,28 @@ async def generate(
         sampling_params=sampling_params,
         image_data=image_data,
         video_data=video_data,
+        audio_data=audio_data,
+        mm_processor_kwargs=mm_processor_kwargs,
         progress_ctx=progress_ctx,
         kwargs=kwargs,
         call_timeout_s=self._ft_call_timeout_s() if ft_on else None,
         translate_fault=ft_on,
     )
+    # Match the native v0.9.0 convention: a plain successful result reports its
+    # weight version as both min and max (never overwrite an existing range).
+    global_steps = output.extra_fields.get("global_steps")
+    output.extra_fields.setdefault("min_global_steps", global_steps)
+    output.extra_fields.setdefault("max_global_steps", global_steps)
     output.extra_fields["llm_generate_attempts"] = 1
     return output
 
 
 # ---------------------------------------------------------------------------
-# FullyLLMServerClient — FT + token continuation in the resume loop
+# FullyAsyncLLMServerClient — FT + token continuation in the resume loop
 # ---------------------------------------------------------------------------
 
 
-@add(FullyLLMServerClient, "_ft_max_request_retries")
+@add(FullyAsyncLLMServerClient, "_ft_max_request_retries")
 def _fully_ft_max_request_retries(self) -> int:
     try:
         return int(self.config.async_training.fault_tolerance.max_request_retries)
@@ -406,7 +450,7 @@ def _fully_ft_max_request_retries(self) -> int:
         return 3
 
 
-@add(FullyLLMServerClient, "_progress_enabled")
+@add(FullyAsyncLLMServerClient, "_progress_enabled")
 def _progress_enabled(self) -> bool:
     """True only when FT master switch AND progress sub-switch are both on."""
     if not self._ft_enabled():
@@ -419,7 +463,7 @@ def _progress_enabled(self) -> bool:
         return False
 
 
-@add(FullyLLMServerClient, "_flush_token_interval")
+@add(FullyAsyncLLMServerClient, "_flush_token_interval")
 def _flush_token_interval(self) -> int:
     try:
         return int(
@@ -433,7 +477,7 @@ def _flush_token_interval(self) -> int:
         return 64
 
 
-@add(FullyLLMServerClient, "_model_version_policy")
+@add(FullyAsyncLLMServerClient, "_model_version_policy")
 def _model_version_policy(self):
     from verl.workers.rollout.fault_tolerance import ModelVersionPolicy
 
@@ -447,8 +491,8 @@ def _model_version_policy(self):
     return ModelVersionPolicy(mode="exact")
 
 
-@patch(FullyLLMServerClient, "generate")
-@_native_when_ft_disabled(FullyLLMServerClient)
+@patch(FullyAsyncLLMServerClient, "generate")
+@_native_when_ft_disabled(FullyAsyncLLMServerClient)
 @rollout_trace_op
 async def _fully_generate(
     self,
@@ -458,6 +502,9 @@ async def _fully_generate(
     sampling_params: dict[str, Any],
     image_data: Optional[list[Any]] = None,
     video_data: Optional[list[Any]] = None,
+    audio_data: Optional[list[Any]] = None,
+    mm_processor_kwargs: Optional[dict[str, Any]] = None,
+    **kwargs: Any,
 ) -> TokenOutput:
     """Generate tokens from prompt ids with FT retry and token continuation.
 
@@ -483,7 +530,7 @@ async def _fully_generate(
         sampling_params[budget_key] = original_max_tokens
     else:
         logger.warning(
-            "[FT] FullyLLMServerClient: cannot resolve generation budget from rollout config; "
+            "[FT] FullyAsyncLLMServerClient: cannot resolve generation budget from rollout config; "
             "token continuation will fall back to the server-side per-attempt default "
             "(each attempt may re-earn a full response_length)"
         )
@@ -523,7 +570,7 @@ async def _fully_generate(
                 if not is_transient_fault(e):
                     raise
                 logger.warning(
-                    "[FT] FullyLLMServerClient: progress store unavailable (%s), "
+                    "[FT] FullyAsyncLLMServerClient: progress store unavailable (%s), "
                     "degrading to fresh attempt (run=%s, recovery_id=%s)",
                     type(e).__name__,
                     self._run_id,
@@ -589,7 +636,9 @@ async def _fully_generate(
                 sampling_params=call_sampling,
                 image_data=image_data,
                 video_data=video_data,
-                kwargs={},
+                audio_data=audio_data,
+                mm_processor_kwargs=mm_processor_kwargs,
+                kwargs=dict(kwargs),
                 call_timeout_s=self._ft_call_timeout_s() if ft_on else None,
                 translate_fault=ft_on,
                 progress_ctx=progress_ctx,
@@ -610,7 +659,9 @@ async def _fully_generate(
                     max_retries,
                     total_llm_generate_attempts,
                 )
-                raise AllServersFailed(f"FullyLLMServerClient: retries exhausted after {retries} attempts") from None
+                raise AllServersFailed(
+                    f"FullyAsyncLLMServerClient: retries exhausted after {retries} attempts"
+                ) from None
             logger.warning(
                 "[FT] prompt retry %d/%d: server %s failed (%s: %s) for request_id=%s, "
                 "resetting to original prompt and retrying on a fresh server",
@@ -704,7 +755,7 @@ async def _fully_generate(
     final_output.extra_fields["llm_generate_retries"] = retries
     if retries > 0 or total_llm_generate_attempts > 1:
         logger.warning(
-            "[FT] FullyLLMServerClient.generate completed after recovery: request_id=%s "
+            "[FT] FullyAsyncLLMServerClient.generate completed after recovery: request_id=%s "
             "attempts=%d retries=%d tokens=%d stop_reason=%s",
             request_id,
             total_llm_generate_attempts,
@@ -721,9 +772,28 @@ async def _fully_generate(
 
 
 @wrap(LLMServerManager, "__init__")
-def _manager_init(orig, self, config, worker_group=None, rollout_resource_pool=None):
-    """LLMServerManager tracking a process-level run_id for token continuation."""
-    orig(self, config, worker_group=worker_group, rollout_resource_pool=rollout_resource_pool)
+def _manager_init(
+    orig,
+    self,
+    config,
+    worker_group=None,
+    rollout_resource_pool=None,
+    start_rank: int = 0,
+    load_balancer_cls=None,
+):
+    """LLMServerManager tracking a process-level run_id for token continuation.
+
+    Must accept and forward every native v0.9.0 constructor parameter
+    (``start_rank``, ``load_balancer_cls``) — callers pass them by keyword.
+    """
+    orig(
+        self,
+        config,
+        worker_group=worker_group,
+        rollout_resource_pool=rollout_resource_pool,
+        start_rank=start_rank,
+        load_balancer_cls=load_balancer_cls,
+    )
     self.run_id = f"{socket.gethostname()}_{os.getpid()}_{uuid4().hex[:8]}"
     self._progress_store = None
     self.max_model_len = self._resolve_max_model_len()
@@ -814,32 +884,38 @@ async def _init_global_load_balancer(self) -> None:
 
 
 @patch(LLMServerManager, "get_client")
-def get_client(self, fully_async: bool = False, retry: bool = False) -> LLMServerClient:
+def get_client(self, client_cls: type[LLMServerClient] | None = None, **kwargs) -> LLMServerClient:
     """Get the LLMServerClient to request LLM server replicas.
 
+    Mirrors the native v0.9.0 ``get_client(client_cls=None, **kwargs)`` factory:
+
+    - FT-off: delegate to the native factory with the caller's arguments
+      unchanged (native clients get the native LB returning
+      ``(server_id, handle)``).
+    - FT-on: instantiate the requested client with the recipe's fault-tolerance
+      context — the elastic-LB handle, the handle registry (``servers``), the
+      process ``run_id``, the progress store and ``max_model_len`` — merged
+      under any caller kwargs (e.g. ``only_hybrid``).
+
     Args:
-        fully_async (bool): Whether to return the FullyLLMServerClient.
-        retry (bool): Whether to retry on server unavailability when FT is enabled.
+        client_cls: The client class to instantiate. Defaults to
+            :class:`LLMServerClient`.
+        **kwargs: Forwarded to the client constructor.
     """
     if not self._ft_enabled():
-        return self._orig_get_client(fully_async=fully_async)
+        return self._orig_get_client(client_cls=client_cls, **kwargs)
 
-    servers = dict(zip(self.server_addresses, self.server_handles, strict=True))
+    client_cls = client_cls or LLMServerClient
     common = dict(
         config=self.config,
-        servers=servers,
+        servers=dict(zip(self.server_addresses, self.server_handles, strict=True)),
         load_balancer_handle=self.global_load_balancer,
         run_id=self.run_id,
         progress_store=self._progress_store,
         max_model_len=self.max_model_len,
     )
-    if fully_async:
-        return FullyLLMServerClient(**common)
-    if retry:
-        from verl.workers.rollout.fault_tolerance.retry_client import RetryLLMServerClient
-
-        return RetryLLMServerClient(**common)
-    return LLMServerClient(config=self.config, servers=servers, load_balancer_handle=self.global_load_balancer)
+    common.update(kwargs)
+    return client_cls(**common)
 
 
 @add(LLMServerManager, "spawn_replacement")

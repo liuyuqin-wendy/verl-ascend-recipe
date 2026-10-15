@@ -13,7 +13,7 @@
 # limitations under the License.
 """VLLMProgressCheckPoint: per-request progress capture + resume bookkeeping.
 
-The checkpoint is constructed in ``FullyLLMServerClient.generate`` (driver side)
+The checkpoint is constructed in ``FullyAsyncLLMServerClient.generate`` (driver side)
 and serialized via ``ProgressContext`` to ``vLLMHttpServer.generate`` (rollout
 replica process) where ``ingest`` is called inside the ``async for`` streaming
 loop. Flushes are fire-and-forget ``store.save.remote(payload)`` calls; the
@@ -276,7 +276,7 @@ class VLLMProgressCheckPoint:
         flush_token_interval: int,
         model_version_policy: ModelVersionPolicy,
     ) -> ResumeResult:
-        """Entry point called by ``FullyLLMServerClient.generate``.
+        """Entry point called by ``FullyAsyncLLMServerClient.generate``.
 
         1. ``store.load_latest(run_id, recovery_id, model_weight_version, policy)``
         2. On hit (payload not None): new ``attempt_id = payload.attempt_id + 1``,

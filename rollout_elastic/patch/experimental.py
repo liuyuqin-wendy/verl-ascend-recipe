@@ -74,6 +74,7 @@ from verl.utils.ray_utils import auto_await
 from verl.utils.rollout_trace import RolloutTraceConfig
 from verl.utils.tracking import Tracking
 from verl.workers.rollout.fault_tolerance import filter_partial_batch
+from verl.workers.rollout.fault_tolerance.retry_client import RetryLLMServerClient
 from verl.workers.rollout.llm_server import FullyAsyncLLMServerClient, LLMServerManager
 
 from ._core import add, patch, patch_module_function, unwrap_ray_remote, wrap
@@ -381,7 +382,6 @@ def _one_step_init_async_rollout_manager(self):
     self.async_rollout_mode = True
     # Retrying client: request unavailability is surfaced as bounded retries
     # instead of failing the generation call; native client when FT is off.
-    from verl.workers.rollout.fault_tolerance.retry_client import RetryLLMServerClient
 
     self.async_rollout_manager = AgentLoopManager.create(
         config=self.config,
@@ -411,7 +411,8 @@ async def _one_step_init_progress(self) -> None:
 
     await self.llm_server_manager._init_progress_store(progress_config)
     _ft_logging.getLogger(__name__).info(
-        "[FT] one-step token continuation enabled: run_id=%s, store=%s(client resolved via get_client(retry = True))",
+        "[FT] one-step token continuation enabled: run_id=%s, store=%s "
+        "(client resolved via get_client(client_cls=RetryLLMServerClient))",
         self.llm_server_manager.run_id,
         progress_config.persist_root,
     )
@@ -858,8 +859,8 @@ async def _rollouter_init_fully_async_progress(self):
     Mirrors one_step_off_policy's _init_one_step_progress. Only runs when both
     ``async_training.fault_tolerance.enabled`` and
     ``async_training.fault_tolerance.progress.enabled`` are True. The store handle
-    is wired into every FullyLLMServerClient produced by
-    ``llm_server_manager.get_client(fully_async=True)``, which is what turns on the
+    is wired into every FullyAsyncLLMServerClient produced by
+    ``llm_server_manager.get_client(client_cls=FullyAsyncLLMServerClient)``, which is what turns on the
     token-continuation retry path.
     """
     import logging as _ft_logging
