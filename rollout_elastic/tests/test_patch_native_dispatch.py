@@ -191,6 +191,28 @@ class TestClearKvCacheIsolation(unittest.TestCase):
         source = (Path(__file__).parents[1] / "patch" / "vllm.py").read_text(encoding="utf-8")
         self.assertIn("server_handle.clear_kv_cache.remote()", source)
 
+    def test_vllm_generate_override_keeps_v09_request_surface(self):
+        """The recipe override must accept every native server request field."""
+        path = Path(__file__).parents[1] / "patch" / "vllm.py"
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        generate = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == "generate"
+        )
+        names = {arg.arg for arg in generate.args.args + generate.args.kwonlyargs}
+        self.assertTrue(
+            {
+                "image_data",
+                "video_data",
+                "audio_data",
+                "mm_processor_kwargs",
+                "priority",
+                "kv_transfer_params",
+                "progress_ctx",
+            }.issubset(names)
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

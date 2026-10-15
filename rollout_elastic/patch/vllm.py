@@ -238,7 +238,10 @@ if vLLMHttpServer is not None:
         request_id: str,
         image_data=None,
         video_data=None,
+        audio_data=None,
+        mm_processor_kwargs=None,
         priority: int = 0,
+        kv_transfer_params=None,
         progress_ctx=None,
     ):
         """Generate sequence with token-in-token-out.
@@ -295,6 +298,10 @@ if vLLMHttpServer is not None:
         )
         sampling_params["logprobs"] = 0 if sampling_params.pop("logprobs", False) else None
         sampling_params.setdefault("repetition_penalty", self.config.get("repetition_penalty", 1.0))
+        if kv_transfer_params is not None:
+            extra_args = dict(sampling_params.pop("extra_args", None) or {})
+            extra_args["kv_transfer_params"] = kv_transfer_params
+            sampling_params["extra_args"] = extra_args
         sampling_params = SamplingParams(max_tokens=max_tokens, **sampling_params)
         prompt_ids = qwen2_5_vl_dedup_image_tokens(prompt_ids, self.model_config.processor)
         multi_modal_data = {}
@@ -302,8 +309,17 @@ if vLLMHttpServer is not None:
             multi_modal_data["image"] = image_data
         if video_data is not None:
             multi_modal_data["video"] = video_data
+        if audio_data is not None:
+            multi_modal_data["audio"] = audio_data
 
-        prompt = TokensPrompt(prompt_token_ids=prompt_ids, multi_modal_data=multi_modal_data)
+        prompt_kwargs = {"prompt_token_ids": prompt_ids, "multi_modal_data": multi_modal_data}
+        if mm_processor_kwargs:
+            prompt_kwargs["mm_processor_kwargs"] = mm_processor_kwargs
+        try:
+            prompt = TokensPrompt(**prompt_kwargs)
+        except TypeError:
+            # Older vLLM prompt classes may not expose optional processor kwargs.
+            prompt = prompt_kwargs
 
         # Add lora request
         lora_request = None
