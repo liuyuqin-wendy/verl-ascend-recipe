@@ -58,7 +58,8 @@ export VERL_USE_EXTERNAL_MODULES=rollout_elastic.patch
 
 # 3. fully-async
 python3 -m rollout_elastic.fully_async_main \
-    --config-path=config --config-name='fully_async_ppo_trainer' \
+    --config-path="$PWD/rollout_elastic/experimental/fully_async_policy/config" \
+    --config-name='fully_async_ppo_trainer' \
     actor_rollout_ref.model.path=<MODEL_PATH> \
     data.train_files=<TRAIN_FILES> \
     rollout.n_gpus_per_node=8
