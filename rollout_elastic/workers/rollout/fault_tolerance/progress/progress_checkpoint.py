@@ -106,6 +106,7 @@ class VLLMProgressCheckPoint:
             return
 
         if global_steps is not None:
+            self.model_weight_version = str(global_steps)
             self.min_global_steps = min(v for v in (self.min_global_steps, global_steps) if v is not None)
             self.max_global_steps = max(v for v in (self.max_global_steps, global_steps) if v is not None)
 

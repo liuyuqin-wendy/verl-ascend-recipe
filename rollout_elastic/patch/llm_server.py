@@ -294,6 +294,7 @@ async def _generate_once(
     call_timeout_s: Optional[float] = None,
     translate_fault: bool = False,
     progress_ctx: Optional[Any] = None,
+    prepare_request=None,
 ) -> tuple[TokenOutput, str]:
     """Single acquire -> call -> release on one server.
 
@@ -314,6 +315,11 @@ async def _generate_once(
 
     try:
         try:
+            if prepare_request is not None:
+                prepared = await prepare_request(server)
+                if isinstance(prepared, TokenOutput):
+                    return prepared, server_id
+                prompt_ids, sampling_params, progress_ctx = prepared
             if progress_ctx is not None:
                 kwargs = {**(kwargs or {}), "progress_ctx": progress_ctx}
             output = await self._call_server(
@@ -331,6 +337,10 @@ async def _generate_once(
             )
             return output, server_id
         except Exception as e:
+            cause = getattr(e, "cause", None) or e
+            if isinstance(cause, ServerUnavailable):
+                # A version race requires retry, not isolation of a healthy replica.
+                raise ServerUnavailable(server_id, cause=cause) from e
             if translate_fault and is_transient_fault(e):
                 await self._mark_server_failed(server_id)
                 raise ServerUnavailable(server_id, cause=e) from e
@@ -548,95 +558,111 @@ async def _fully_generate(
         # ----- decide prefix + progress_ctx for this attempt -----
         checkpoint = None
         progress_ctx = None
-        if progress_on:
-            from verl.workers.rollout.fault_tolerance import (
-                ProgressContext,
-                VLLMProgressCheckPoint,
-                is_transient_fault,
-            )
 
-            try:
-                result = await VLLMProgressCheckPoint.create_or_resume(
-                    store=self._progress_store,
-                    run_id=self._run_id,
-                    recovery_id=recovery_id,
-                    prompt_token_ids=original_prompt,
-                    sampling_params=original_sampling,
-                    model_weight_version=model_weight_version,
-                    flush_token_interval=self._flush_token_interval(),
-                    model_version_policy=self._model_version_policy(),
+        async def prepare_request(server):
+            nonlocal checkpoint, progress_ctx, final_output, sampling_params, recovery_id
+            nonlocal min_global_steps, max_global_steps, global_steps, model_weight_version
+            if progress_on:
+                from verl.workers.rollout.fault_tolerance import (
+                    ProgressContext,
+                    VLLMProgressCheckPoint,
+                    is_transient_fault,
                 )
-            except Exception as e:
-                if not is_transient_fault(e):
-                    raise
-                logger.warning(
-                    "[FT] FullyAsyncLLMServerClient: progress store unavailable (%s), "
-                    "degrading to fresh attempt (run=%s, recovery_id=%s)",
-                    type(e).__name__,
-                    self._run_id,
-                    recovery_id,
+
+                model_weight_version = await asyncio.wait_for(
+                    server.get_global_steps.remote(), timeout=self._ft_call_timeout_s()
                 )
-                prefix_for_call = original_prompt
-                call_sampling = sampling_params
-            else:
-                checkpoint = result.checkpoint
-                # The retained tokens, rather than previous failed RPCs, own the range.
-                min_global_steps = checkpoint.min_global_steps
-                max_global_steps = checkpoint.max_global_steps
-                progress_ctx = ProgressContext(checkpoint=checkpoint)
-                prefix_for_call = checkpoint.resume_prefix_token_ids()
-                call_sampling = copy.deepcopy(original_sampling)
-                if original_max_tokens is not None:
-                    remaining_max_tokens = checkpoint.remaining_max_tokens()
-                    if remaining_max_tokens <= 0:
-                        # The persisted continuation already consumed the
-                        # complete request budget.  Finish locally instead of
-                        # passing zero to the server, which would either be
-                        # rejected by vLLM or be coerced to one token.
-                        final_output = TokenOutput(
-                            token_ids=list(checkpoint.cumulative_token_ids),
-                            log_probs=(
-                                list(checkpoint.cumulative_log_probs)
-                                if checkpoint.cumulative_log_probs is not None
-                                else []
-                            ),
-                            routed_experts=checkpoint.cumulative_routed_experts,
-                            num_preempted=checkpoint.num_preempted,
-                            stop_reason="length",
-                        )
-                        break
-                    call_sampling[budget_key] = remaining_max_tokens
-                # Seed final_output with inherited cumulative so that after fault reset
-                # (where final_output was cleared) the persisted tokens are not lost.
-                # On the abort path this is idempotent (cumulative == existing final_output).
-                if checkpoint.inherited_prefix_len > 0:
+                if model_weight_version is not None:
+                    model_weight_version = str(model_weight_version)
+                try:
+                    result = await VLLMProgressCheckPoint.create_or_resume(
+                        store=self._progress_store,
+                        run_id=self._run_id,
+                        recovery_id=recovery_id,
+                        prompt_token_ids=original_prompt,
+                        sampling_params=original_sampling,
+                        model_weight_version=model_weight_version,
+                        flush_token_interval=self._flush_token_interval(),
+                        model_version_policy=self._model_version_policy(),
+                    )
+                except Exception as e:
+                    if not is_transient_fault(e):
+                        raise
                     logger.warning(
-                        "[FT] token continuation from checkpoint: resuming with %d inherited tokens "
-                        "(run=%s, recovery_id=%s, attempt=%s, resume_prefix_len=%d, remaining_max_tokens=%s)",
-                        checkpoint.inherited_prefix_len,
+                        "[FT] FullyAsyncLLMServerClient: progress store unavailable (%s), "
+                        "degrading to fresh attempt (run=%s, recovery_id=%s)",
+                        type(e).__name__,
                         self._run_id,
                         recovery_id,
-                        checkpoint.attempt_id,
-                        len(prefix_for_call),
-                        call_sampling.get(budget_key),
                     )
-                    final_output = TokenOutput(
-                        token_ids=list(checkpoint.cumulative_token_ids),
-                        log_probs=list(checkpoint.cumulative_log_probs) if checkpoint.cumulative_log_probs else [],
-                        routed_experts=checkpoint.cumulative_routed_experts,
-                        num_preempted=checkpoint.num_preempted,
-                    )
-        else:
-            progress_ctx = None
-            prefix_for_call = original_prompt + final_output.token_ids
-            call_sampling = sampling_params
+                    # Discard the old answer branch and its recovery identity together.
+                    final_output = TokenOutput(token_ids=[], log_probs=[], num_preempted=0)
+                    min_global_steps, max_global_steps, global_steps = None, None, None
+                    recovery_id = uuid4().hex
+                    sampling_params = copy.deepcopy(original_sampling)
+                    prefix_for_call = original_prompt
+                    call_sampling = copy.deepcopy(original_sampling)
+                else:
+                    checkpoint = result.checkpoint
+                    # The retained tokens, rather than previous failed RPCs, own the range.
+                    min_global_steps = checkpoint.min_global_steps
+                    max_global_steps = checkpoint.max_global_steps
+                    progress_ctx = ProgressContext(checkpoint=checkpoint)
+                    prefix_for_call = checkpoint.resume_prefix_token_ids()
+                    call_sampling = copy.deepcopy(original_sampling)
+                    if original_max_tokens is not None:
+                        remaining_max_tokens = checkpoint.remaining_max_tokens()
+                        if remaining_max_tokens <= 0:
+                            # The persisted continuation already consumed the
+                            # complete request budget.  Finish locally instead of
+                            # passing zero to the server, which would either be
+                            # rejected by vLLM or be coerced to one token.
+                            final_output = TokenOutput(
+                                token_ids=list(checkpoint.cumulative_token_ids),
+                                log_probs=(
+                                    list(checkpoint.cumulative_log_probs)
+                                    if checkpoint.cumulative_log_probs is not None
+                                    else []
+                                ),
+                                routed_experts=checkpoint.cumulative_routed_experts,
+                                num_preempted=checkpoint.num_preempted,
+                                stop_reason="length",
+                            )
+                            return final_output
+                        call_sampling[budget_key] = remaining_max_tokens
+                    # Seed final_output with inherited cumulative so that after fault reset
+                    # (where final_output was cleared) the persisted tokens are not lost.
+                    # On the abort path this is idempotent (cumulative == existing final_output).
+                    if checkpoint.inherited_prefix_len > 0:
+                        logger.warning(
+                            "[FT] token continuation from checkpoint: resuming with %d inherited tokens "
+                            "(run=%s, recovery_id=%s, attempt=%s, resume_prefix_len=%d, remaining_max_tokens=%s)",
+                            checkpoint.inherited_prefix_len,
+                            self._run_id,
+                            recovery_id,
+                            checkpoint.attempt_id,
+                            len(prefix_for_call),
+                            call_sampling.get(budget_key),
+                        )
+                        final_output = TokenOutput(
+                            token_ids=list(checkpoint.cumulative_token_ids),
+                            log_probs=list(checkpoint.cumulative_log_probs) if checkpoint.cumulative_log_probs else [],
+                            routed_experts=checkpoint.cumulative_routed_experts,
+                            num_preempted=checkpoint.num_preempted,
+                        )
+            else:
+                progress_ctx = None
+                prefix_for_call = original_prompt + final_output.token_ids
+                call_sampling = sampling_params
+
+            return prefix_for_call, call_sampling, progress_ctx
 
         # 1. generate tokens — catch ServerUnavailable to retry on a fresh server
         try:
             output, _ = await self._generate_once(
                 request_id=current_request_id,
-                prompt_ids=prefix_for_call,
-                sampling_params=call_sampling,
+                prompt_ids=original_prompt,
+                sampling_params=original_sampling,
                 image_data=image_data,
                 video_data=video_data,
                 audio_data=audio_data,
@@ -644,7 +670,7 @@ async def _fully_generate(
                 kwargs=dict(kwargs),
                 call_timeout_s=self._ft_call_timeout_s() if ft_on else None,
                 translate_fault=ft_on,
-                progress_ctx=progress_ctx,
+                prepare_request=prepare_request,
             )
             total_llm_generate_attempts += 1
         except ServerUnavailable as e:
@@ -681,6 +707,9 @@ async def _fully_generate(
             current_request_id = uuid4().hex
             model_weight_version = None
             continue
+
+        if output is final_output:
+            break
 
         # 2. merge output into final_output
         if progress_on and checkpoint is not None:
@@ -758,7 +787,7 @@ async def _fully_generate(
             len(output.token_ids),
             current_request_id,
             total_llm_generate_attempts,
-            len(prefix_for_call) + len(output.token_ids),
+            len(original_prompt) + len(final_output.token_ids),
         )
 
     final_output.extra_fields["global_steps"] = global_steps

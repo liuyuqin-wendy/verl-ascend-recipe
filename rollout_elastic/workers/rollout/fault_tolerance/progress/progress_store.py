@@ -231,6 +231,14 @@ class RolloutProgressStore:
         if not policy.check(manifest.get("model_weight_version"), requested_model_version):
             return LoadResult(None, LoadFailure.MODEL_VERSION_BLOCKED, "model_version blocked", aid)
 
+        if policy.mode == "exact" and (
+            manifest.get("min_global_steps") is None
+            or manifest.get("max_global_steps") is None
+            or str(manifest["min_global_steps"]) != str(requested_model_version)
+            or str(manifest["max_global_steps"]) != str(requested_model_version)
+        ):
+            return LoadResult(None, LoadFailure.MODEL_VERSION_BLOCKED, "prefix version range blocked", aid)
+
         payload = self._assemble_payload(manifest, tokens, logprobs, routing)
         return LoadResult(payload, None, "ok", aid)
 
