@@ -45,11 +45,11 @@ actor_ppo_max_token_len=$(((max_prompt_length + max_response_length)))
 infer_ppo_max_token_len=$(((max_prompt_length + max_response_length)))
 
 # Megatron Parallelism Configuration
-train_tp=8
+train_tp=2
 train_ep=32
 train_etp=1
-train_pp=2
-train_cp=1
+train_pp=4
+train_cp=8
 
 
 # Generation Configuration
@@ -259,7 +259,6 @@ ACTOR_CONFIG=(
     +actor_rollout_ref.actor.mindspeed.llm_kwargs.masked_softmax_fusion=False
     +actor_rollout_ref.actor.mindspeed.llm_kwargs.moe_shared_expert_overlap=False
     +actor_rollout_ref.actor.mindspeed.llm_kwargs.indexer_loss_coeff=0.0
-
     +actor_rollout_ref.actor.mindspeed.llm_kwargs.swap_optimizer=False
     +actor_rollout_ref.actor.optim.override_optimizer_config.optimizer_cpu_offload=True
     +actor_rollout_ref.actor.optim.override_optimizer_config.use_precision_aware_optimizer=True
@@ -349,9 +348,6 @@ TRAINER_CONFIG=(
     trainer.use_legacy_worker_impl=disable
 )
 
-
-
-
 PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     --config-name='ppo_trainer.yaml' \
     model_engine=mindspeed \
@@ -362,7 +358,6 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     "${ROLLOUT_CONFIG[@]}" \
     "${ALGORITHM_CONFIG[@]}" \
     "${TRAINER_CONFIG[@]}" \
-    "$@" 2>&1 | tee logs/run_deepseek_v4_npu_$(date +%Y%m%d_%H%M%S).log
-
+    "$@" 2>&1 | tee ./run_deepseek_v4_npu_$(date +%Y%m%d_%H%M%S).log
 
 
