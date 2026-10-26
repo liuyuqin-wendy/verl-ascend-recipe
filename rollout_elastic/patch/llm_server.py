@@ -580,6 +580,9 @@ async def _fully_generate(
                 call_sampling = sampling_params
             else:
                 checkpoint = result.checkpoint
+                # The retained tokens, rather than previous failed RPCs, own the range.
+                min_global_steps = checkpoint.min_global_steps
+                max_global_steps = checkpoint.max_global_steps
                 progress_ctx = ProgressContext(checkpoint=checkpoint)
                 prefix_for_call = checkpoint.resume_prefix_token_ids()
                 call_sampling = copy.deepcopy(original_sampling)
@@ -714,9 +717,19 @@ async def _fully_generate(
             final_output.stop_reason = output.stop_reason
 
         global_steps = output.extra_fields.get("global_steps", None)
-        if min_global_steps is None:
-            min_global_steps = global_steps
-        max_global_steps = global_steps
+        if output.token_ids:
+            lower = [
+                v
+                for v in (min_global_steps, output.extra_fields.get("min_global_steps", global_steps))
+                if v is not None
+            ]
+            upper = [
+                v
+                for v in (max_global_steps, output.extra_fields.get("max_global_steps", global_steps))
+                if v is not None
+            ]
+            min_global_steps = min(lower) if lower else None
+            max_global_steps = max(upper) if upper else None
         model_weight_version = global_steps
 
         # 3. update the generation budget; truncate (FT only) to the original budget
